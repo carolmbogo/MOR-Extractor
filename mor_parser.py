@@ -59,9 +59,19 @@ class DetectedDataset:
 
 
 def clean_text(value) -> str:
+    """Return clean text; missing Excel values always become blank."""
     if value is None:
         return ""
-    return re.sub(r"\s+", " ", str(value).strip())
+    try:
+        missing = pd.isna(value)
+        if isinstance(missing, bool) and missing:
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "nat"}:
+        return ""
+    return re.sub(r"\s+", " ", text)
 
 
 def parse_value(text: str):
@@ -374,29 +384,42 @@ def score_header_row(row):
     return text_ratio * 2 + uniqueness + keyword_score
 
 
-def forward_fill_merged_like(rows):
+def apply_real_merged_headers(rows, header_top, header_bottom, merged_ranges):
     """
-    Simulate visual merged-cell parent headings.
-
-    Excel stores the value only in the top-left cell of a merged range.
-    When reading legacy .xls, merged structure is often unavailable to us.
-    This cautiously carries a parent label to the right across blanks until
-    another value appears in that same header row.
+    Expand only actual Excel merged cells across the detected header band.
+    Ordinary blank cells remain blank.
     """
-    filled = []
-    for row in rows:
-        r = [clean_text(v) for v in row]
-        out = []
-        last = ""
-        for val in r:
-            if val:
-                last = val
-                out.append(val)
-            else:
-                out.append(last)
-        filled.append(out)
-    return filled
+    header_rows = [
+        [clean_text(v) for v in row]
+        for row in rows[header_top:header_bottom + 1]
+    ]
 
+    if not merged_ranges:
+        return header_rows
+
+    width = max((len(r) for r in header_rows), default=0)
+    header_rows = [r + [""] * (width - len(r)) for r in header_rows]
+
+    for r0, r1, c0, c1 in merged_ranges:
+        if r1 <= header_top or r0 > header_bottom:
+            continue
+
+        source = ""
+        if 0 <= r0 < len(rows) and 0 <= c0 < len(rows[r0]):
+            source = clean_text(rows[r0][c0])
+
+        if not source:
+            continue
+
+        start_r = max(r0, header_top)
+        end_r = min(r1, header_bottom + 1)
+
+        for rr in range(start_r, end_r):
+            local_r = rr - header_top
+            for cc in range(c0, min(c1, width)):
+                header_rows[local_r][cc] = source
+
+    return header_rows
 
 def header_path_for_column(header_rows, col_idx):
     pieces = []
@@ -414,66 +437,59 @@ def header_path_for_column(header_rows, col_idx):
 
 def compact_header_name(path):
     """
-    Build a concise column name from a vertical header hierarchy.
-
-    Example:
-      PLANT INFLUENT > DAILY > Daily > Flow > MGD
-    becomes:
-      Daily Flow (MGD)
-
-    MAX > Flow > MGD becomes:
-      Max Flow (MGD)
+    Build a concise field name from the merged parent heading,
+    subheading, qualifier, and unit.
     """
     if not path:
         return ""
 
-    # Separate units from descriptive labels.
     units = [normalize_unit(x) for x in path if is_unit(x)]
     words = [clean_text(x) for x in path if clean_text(x) and not is_unit(x)]
 
-    # Remove exact duplicate levels, case-insensitively.
     deduped = []
     for w in words:
         if not deduped or deduped[-1].lower() != w.lower():
             deduped.append(w)
     words = deduped
 
-    # Remove very broad group headings when more specific levels exist.
-    broad_groups = {
+    if not words:
+        return f"({units[-1]})" if units else ""
+
+    structural_groups = {
         "plant influent", "plant effluent", "influent parameters",
-        "final effluent parameters", "5 day c.b.o.d", "5 day c.b.o.d.",
-        "5 day bod", "cbod", "bod"
+        "final effluent parameters", "operations report", "daily", "date"
     }
 
-    if len(words) > 2:
-        words = [w for w in words if w.lower() not in broad_groups] or words
+    family_markers = (
+        "suspended solid", "settled solid", "ammonia", "nitrogen",
+        "phosph", "bod", "c.b.o.d", "cbod", "chlor", "grease",
+        "dissolved oxygen", "fecal", "e. coli", "ph"
+    )
 
-    # Collapse repeated adjective/leaf combinations:
-    # DAILY > Daily > Flow -> Daily Flow
+    parent = words[0]
+    parent_low = parent.lower()
+    preserve_parent = (
+        parent_low not in structural_groups
+        and any(marker in parent_low for marker in family_markers)
+    )
+
+    working = [w for w in words if w.lower() not in structural_groups]
+    if not working:
+        working = words
+
     cleaned = []
-    for w in words:
-        low = w.lower()
-        if cleaned and cleaned[-1].lower() == low:
-            continue
-        cleaned.append(w)
-    words = cleaned
+    for w in working:
+        if not cleaned or cleaned[-1].lower() != w.lower():
+            cleaned.append(w)
+    working = cleaned
 
-    # Prefer the last 2-3 meaningful levels so headers stay readable.
-    if len(words) >= 3:
-        last = words[-1].lower()
-        prev = words[-2].lower()
-        if last in {"flow", "temp", "temperature", "bod", "cbod", "ph", "do", "tss", "solids"}:
-            candidate = words[-2:]
-            # If the prior level is too generic, include one more parent.
-            if prev in {"raw", "final", "influent", "effluent", "inf", "eff"} and len(words) >= 3:
-                candidate = words[-3:]
-            words = candidate
-        else:
-            words = words[-3:]
+    leaf = working[-3:] if len(working) > 3 else working[:]
 
-    name = " ".join(words).strip()
+    if preserve_parent and all(parent_low != w.lower() for w in leaf):
+        leaf = [parent] + leaf
 
-    # Friendly normalization.
+    name = " ".join(leaf).strip()
+
     replacements = {
         "MAX Flow": "Max Flow",
         "MIN Flow": "Min Flow",
@@ -491,7 +507,6 @@ def compact_header_name(path):
             name = f"{name} ({unit})".strip()
 
     return name
-
 
 def resolve_duplicate_headers(paths, provisional):
     """
@@ -679,7 +694,7 @@ def trim_excel_to_daily_rows(body_rows):
 
     return kept if kept else body_rows
 
-def dataframe_from_rows(rows, sheet_name, source_name):
+def dataframe_from_rows(rows, sheet_name, source_name, merged_ranges=None):
     rows = [list(r) for r in rows]
     rows = [r for r in rows if any(clean_text(v) for v in r)]
     if len(rows) < 2:
@@ -689,8 +704,9 @@ def dataframe_from_rows(rows, sheet_name, source_name):
     rows = [r + [None] * (width - len(r)) for r in rows]
 
     header_top, header_bottom = detect_excel_header_band(rows)
-    raw_header_rows = rows[header_top:header_bottom + 1]
-    header_rows = forward_fill_merged_like(raw_header_rows)
+    header_rows = apply_real_merged_headers(
+        rows, header_top, header_bottom, merged_ranges or []
+    )
 
     paths = [header_path_for_column(header_rows, c) for c in range(width)]
     headers = [compact_header_name(path) for path in paths]
@@ -740,33 +756,53 @@ def extract_excel(data: bytes, source_name: str, selected_sheets=None) -> list[D
     datasets = []
 
     if suffix == ".xls":
-        book = pd.ExcelFile(io.BytesIO(data), engine="xlrd")
-        sheet_names = book.sheet_names
+        import xlrd
+
+        legacy_book = xlrd.open_workbook(file_contents=data, formatting_info=False)
+        sheet_names = legacy_book.sheet_names()
+
         if selected_sheets is not None:
             wanted = set(selected_sheets)
             sheet_names = [s for s in sheet_names if s in wanted]
 
         for sheet_name in sheet_names:
-            raw = pd.read_excel(
-                io.BytesIO(data),
-                sheet_name=sheet_name,
-                header=None,
-                dtype=object,
-                engine="xlrd",
+            sh = legacy_book.sheet_by_name(sheet_name)
+            rows = [sh.row_values(r) for r in range(sh.nrows)]
+            merged_ranges = [
+                (rlow, rhigh, clow, chigh)
+                for (rlow, rhigh, clow, chigh) in sh.merged_cells
+            ]
+
+            ds = dataframe_from_rows(
+                rows, sheet_name, source_name, merged_ranges=merged_ranges
             )
-            ds = dataframe_from_rows(raw.values.tolist(), sheet_name, source_name)
             if ds:
                 datasets.append(ds)
+
         return datasets
 
-    wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    wb = load_workbook(io.BytesIO(data), data_only=True, read_only=False)
     wanted = set(selected_sheets) if selected_sheets is not None else None
 
     for ws in wb.worksheets:
         if wanted is not None and ws.title not in wanted:
             continue
+
         rows = [list(r) for r in ws.iter_rows(values_only=True)]
-        ds = dataframe_from_rows(rows, ws.title, source_name)
+
+        merged_ranges = [
+            (
+                merged.min_row - 1,
+                merged.max_row,
+                merged.min_col - 1,
+                merged.max_col,
+            )
+            for merged in ws.merged_cells.ranges
+        ]
+
+        ds = dataframe_from_rows(
+            rows, ws.title, source_name, merged_ranges=merged_ranges
+        )
         if ds:
             datasets.append(ds)
 

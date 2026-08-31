@@ -20,7 +20,7 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
 
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="mm/dd/yyyy") as writer:
-        df.to_excel(writer, sheet_name="Extracted Data", index=False)
+        df.to_excel(writer, sheet_name="Extracted Data", index=False, na_rep="")
 
         workbook = writer.book
         worksheet = writer.sheets["Extracted Data"]
@@ -269,7 +269,8 @@ if "datasets" in st.session_state:
     preview = df[selected].copy()
 
     st.subheader("3. Preview")
-    st.dataframe(preview, use_container_width=True, height=500)
+    display_preview = preview.astype(object).where(pd.notna(preview), "")
+    st.dataframe(display_preview, use_container_width=True, height=500)
 
     if "Date" in preview.columns:
         valid_dates = pd.to_datetime(preview["Date"], errors="coerce").dropna()
@@ -299,7 +300,7 @@ if "datasets" in st.session_state:
 
     st.download_button(
         "Download CSV",
-        data=preview.to_csv(index=False).encode("utf-8"),
+        data=preview.to_csv(index=False, na_rep="").encode("utf-8"),
         file_name=f"{safe_stem}.csv",
         mime="text/csv",
     )
