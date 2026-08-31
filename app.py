@@ -8,6 +8,7 @@ import streamlit as st
 from mor_parser import (
     combine_same_named_datasets,
     detect_file,
+    get_excel_sheet_names,
     unpack_upload,
 )
 
@@ -39,11 +40,9 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
         for col_idx, col in enumerate(df.columns):
             worksheet.write(0, col_idx, col, header)
-
             sample = [str(x) for x in df[col].head(80).fillna("").tolist()]
             width = min(max([len(str(col))] + [len(x) for x in sample]) + 2, 38)
             worksheet.set_column(col_idx, col_idx, max(width, 12))
-
             if pd.api.types.is_datetime64_any_dtype(df[col]):
                 worksheet.set_column(col_idx, col_idx, max(width, 12), date_fmt)
 
@@ -80,13 +79,27 @@ def sample_values(series, n=8):
     return vals
 
 
+def prepare_items(uploads):
+    items = []
+    errors = []
+
+    for upload in uploads:
+        try:
+            unpacked = unpack_upload(upload.name, upload.getvalue())
+            items.extend(unpacked)
+        except Exception as exc:
+            errors.append(f"{upload.name}: {exc}")
+
+    return items, errors
+
+
 st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
 
 st.title(APP_TITLE)
 st.caption(
     "Upload MOR PDFs, Excel workbooks, or a ZIP of monthly reports. "
-    "The app detects available data fields, shows sample values for verification, "
-    "and exports only the columns you choose."
+    "Choose the worksheet when an Excel file has multiple tabs, select the fields you need, "
+    "verify the values, and export the result."
 )
 
 uploads = st.file_uploader(
@@ -103,29 +116,80 @@ if uploads:
         st.session_state["upload_signature"] = signature
         st.session_state.pop("datasets", None)
         st.session_state.pop("errors", None)
+        st.session_state.pop("prepared_items", None)
+
+    if "prepared_items" not in st.session_state:
+        items, prep_errors = prepare_items(uploads)
+        st.session_state["prepared_items"] = items
+        st.session_state["prep_errors"] = prep_errors
+
+    items = st.session_state["prepared_items"]
+    prep_errors = st.session_state.get("prep_errors", [])
+
+    # ---------------------------------------------------------------
+    # Worksheet selection
+    # ---------------------------------------------------------------
+    excel_items = [(name, data) for name, data in items if Path(name).suffix.lower() in {".xls", ".xlsx", ".xlsm"}]
+    selected_sheets_by_file = {}
+
+    if excel_items:
+        st.subheader("Choose worksheet(s)")
+
+        for idx, (name, data) in enumerate(excel_items):
+            try:
+                sheet_names = get_excel_sheet_names(name, data)
+            except Exception as exc:
+                st.error(f"Could not read worksheet names from {name}: {exc}")
+                sheet_names = []
+
+            if sheet_names:
+                default_sheet = sheet_names[0]
+                # Prefer commonly named MOR/DMR/state tabs when present.
+                preferred = next(
+                    (
+                        s for s in sheet_names
+                        if any(k in s.lower() for k in ("dmr", "mor", "state"))
+                    ),
+                    default_sheet,
+                )
+
+                selection = st.multiselect(
+                    f"{name}",
+                    options=sheet_names,
+                    default=[preferred],
+                    key=f"sheets_{idx}_{name}",
+                    help="Select one or more tabs for the parser to inspect.",
+                )
+                selected_sheets_by_file[name] = selection
+
+        st.caption(
+            "Only the worksheet tabs selected above will be parsed. "
+            "PDF files do not need a worksheet selection."
+        )
 
     if st.button("Detect MOR Fields", type="primary"):
         datasets = []
-        errors = []
+        errors = list(prep_errors)
 
         progress = st.progress(0)
-        items = []
-
-        for upload in uploads:
-            try:
-                unpacked = unpack_upload(upload.name, upload.getvalue())
-                items.extend(unpacked)
-            except Exception as exc:
-                errors.append(f"{upload.name}: {exc}")
-
         total = max(len(items), 1)
 
         for idx, (name, data) in enumerate(items, start=1):
             try:
-                detected = detect_file(name, data)
+                selected_sheets = selected_sheets_by_file.get(name)
+
+                # If an Excel workbook is present but the user selected no tabs,
+                # skip it instead of silently parsing every worksheet.
+                if Path(name).suffix.lower() in {".xls", ".xlsx", ".xlsm"} and selected_sheets == []:
+                    errors.append(f"{name}: no worksheet was selected.")
+                    progress.progress(idx / total)
+                    continue
+
+                detected = detect_file(name, data, selected_sheets=selected_sheets)
                 if not detected:
                     errors.append(f"{name}: no usable daily table was detected.")
                 datasets.extend(detected)
+
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
 
@@ -155,14 +219,13 @@ if "datasets" in st.session_state:
 
     st.success(f"Detected {len(datasets)} data set(s).")
 
-    labels = []
-    for i, ds in enumerate(datasets):
-        labels.append(
-            f"{ds.name} • {len(ds.dataframe):,} rows • {len(ds.dataframe.columns)} fields • {ds.confidence}"
-        )
+    labels = [
+        f"{ds.name} • {len(ds.dataframe):,} rows • {len(ds.dataframe.columns)} fields • {ds.confidence}"
+        for ds in datasets
+    ]
 
     selected_idx = st.selectbox(
-        "Choose the table you want to extract from",
+        "Choose the detected table you want to extract from",
         options=range(len(datasets)),
         format_func=lambda i: labels[i],
     )

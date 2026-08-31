@@ -309,6 +309,49 @@ def extract_pdf(data: bytes, source_name: str) -> list[DetectedDataset]:
     return extract_kub_pdf(data, source_name) if known else extract_generic_pdf(data, source_name)
 
 
+# ----------------------------
+# Excel multi-row header logic
+# ----------------------------
+
+UNIT_WORDS = {
+    "mgd", "mgl", "mg/l", "ppm", "ppb", "inches", "inch", "in", "%",
+    "cel", "deg c", "°c", "gpd", "lbs", "lb", "cfu", "ml", "mg"
+}
+
+GENERIC_WORDS = {
+    "flow", "temp", "temperature", "raw", "final", "influent", "effluent",
+    "daily", "max", "maximum", "min", "minimum", "avg", "average",
+    "plant", "waste", "rain", "fall", "rainfall", "inf", "eff"
+}
+
+
+def normalize_unit(text: str) -> str:
+    t = clean_text(text)
+    low = t.lower()
+    mapping = {
+        "mgl": "mg/L",
+        "mg/l": "mg/L",
+        "mgd": "MGD",
+        "gpd": "GPD",
+        "ppm": "ppm",
+        "ppb": "ppb",
+        "cel": "°C",
+        "deg c": "°C",
+        "°c": "°C",
+        "inches": "in",
+        "inch": "in",
+        "in": "in",
+        "%": "%",
+        "lbs": "lb",
+        "lb": "lb",
+    }
+    return mapping.get(low, t)
+
+
+def is_unit(text: str) -> bool:
+    return clean_text(text).lower() in UNIT_WORDS
+
+
 def score_header_row(row):
     vals = [clean_text(x) for x in row if clean_text(x)]
     if not vals:
@@ -324,11 +367,317 @@ def score_header_row(row):
     uniqueness = len(set(vals)) / len(vals)
     keywords = (
         "date", "flow", "bod", "tss", "solid", "ph", "nh3", "ammonia",
-        "grease", "do", "mlss", "svi", "chlor", "nitrogen", "phosph"
+        "grease", "do", "mlss", "svi", "chlor", "nitrogen", "phosph",
+        "rain", "temp", "influent", "effluent"
     )
     keyword_score = min(sum(k in " ".join(vals).lower() for k in keywords) * 0.4, 2.0)
     return text_ratio * 2 + uniqueness + keyword_score
 
+
+def forward_fill_merged_like(rows):
+    """
+    Simulate visual merged-cell parent headings.
+
+    Excel stores the value only in the top-left cell of a merged range.
+    When reading legacy .xls, merged structure is often unavailable to us.
+    This cautiously carries a parent label to the right across blanks until
+    another value appears in that same header row.
+    """
+    filled = []
+    for row in rows:
+        r = [clean_text(v) for v in row]
+        out = []
+        last = ""
+        for val in r:
+            if val:
+                last = val
+                out.append(val)
+            else:
+                out.append(last)
+        filled.append(out)
+    return filled
+
+
+def header_path_for_column(header_rows, col_idx):
+    pieces = []
+    for row in header_rows:
+        if col_idx >= len(row):
+            continue
+        val = clean_text(row[col_idx])
+        if not val:
+            continue
+        if pieces and pieces[-1].lower() == val.lower():
+            continue
+        pieces.append(val)
+    return pieces
+
+
+def compact_header_name(path):
+    """
+    Build a concise column name from a vertical header hierarchy.
+
+    Example:
+      PLANT INFLUENT > DAILY > Daily > Flow > MGD
+    becomes:
+      Daily Flow (MGD)
+
+    MAX > Flow > MGD becomes:
+      Max Flow (MGD)
+    """
+    if not path:
+        return ""
+
+    # Separate units from descriptive labels.
+    units = [normalize_unit(x) for x in path if is_unit(x)]
+    words = [clean_text(x) for x in path if clean_text(x) and not is_unit(x)]
+
+    # Remove exact duplicate levels, case-insensitively.
+    deduped = []
+    for w in words:
+        if not deduped or deduped[-1].lower() != w.lower():
+            deduped.append(w)
+    words = deduped
+
+    # Remove very broad group headings when more specific levels exist.
+    broad_groups = {
+        "plant influent", "plant effluent", "influent parameters",
+        "final effluent parameters", "5 day c.b.o.d", "5 day c.b.o.d.",
+        "5 day bod", "cbod", "bod"
+    }
+
+    if len(words) > 2:
+        words = [w for w in words if w.lower() not in broad_groups] or words
+
+    # Collapse repeated adjective/leaf combinations:
+    # DAILY > Daily > Flow -> Daily Flow
+    cleaned = []
+    for w in words:
+        low = w.lower()
+        if cleaned and cleaned[-1].lower() == low:
+            continue
+        cleaned.append(w)
+    words = cleaned
+
+    # Prefer the last 2-3 meaningful levels so headers stay readable.
+    if len(words) >= 3:
+        last = words[-1].lower()
+        prev = words[-2].lower()
+        if last in {"flow", "temp", "temperature", "bod", "cbod", "ph", "do", "tss", "solids"}:
+            candidate = words[-2:]
+            # If the prior level is too generic, include one more parent.
+            if prev in {"raw", "final", "influent", "effluent", "inf", "eff"} and len(words) >= 3:
+                candidate = words[-3:]
+            words = candidate
+        else:
+            words = words[-3:]
+
+    name = " ".join(words).strip()
+
+    # Friendly normalization.
+    replacements = {
+        "MAX Flow": "Max Flow",
+        "MIN Flow": "Min Flow",
+        "Daily Daily Flow": "Daily Flow",
+        "RAIN FALL": "Rainfall",
+        "Rain Fall": "Rainfall",
+        "RAW WASTE TEMP": "Raw Waste Temp",
+        "FINAL EFF TEMP": "Final Eff Temp",
+    }
+    name = replacements.get(name, name)
+
+    if units:
+        unit = units[-1]
+        if unit and f"({unit})" not in name:
+            name = f"{name} ({unit})".strip()
+
+    return name
+
+
+def resolve_duplicate_headers(paths, provisional):
+    """
+    If two columns still have the same concise name, progressively prepend
+    higher parent levels until the names become unique.
+    """
+    result = list(provisional)
+
+    for _ in range(5):
+        counts = {}
+        for n in result:
+            counts[n.lower()] = counts.get(n.lower(), 0) + 1
+
+        changed = False
+        for i, name in enumerate(result):
+            if not name or counts.get(name.lower(), 0) <= 1:
+                continue
+
+            path = [x for x in paths[i] if x and not is_unit(x)]
+            unit = next((normalize_unit(x) for x in reversed(paths[i]) if is_unit(x)), "")
+
+            current_words = [x for x in re.sub(r"\s+\([^)]*\)$", "", name).split(" ") if x]
+            current_low = " ".join(current_words).lower()
+
+            # Find the nearest higher-level piece not already represented.
+            chosen = None
+            for parent in reversed(path[:-1]):
+                plow = parent.lower()
+                if plow not in current_low:
+                    chosen = parent
+                    break
+
+            if chosen:
+                base = re.sub(r"\s+\([^)]*\)$", "", name)
+                new_name = f"{chosen} {base}".strip()
+                if unit:
+                    new_name += f" ({unit})"
+                result[i] = new_name
+                changed = True
+
+        if not changed:
+            break
+
+    return make_unique(result)
+
+
+def detect_excel_header_band(rows):
+    """
+    Find the likely top and bottom of a multi-row Excel header area.
+
+    We score the first 15 populated rows, choose the strongest header-like row,
+    then include nearby rows above/below that are mostly text or units.
+    """
+    max_scan = min(15, len(rows))
+    if max_scan == 0:
+        return 0, 0
+
+    scores = [score_header_row(rows[i]) for i in range(max_scan)]
+    anchor = max(range(max_scan), key=lambda i: scores[i])
+
+    top = max(0, anchor - 4)
+    bottom = min(len(rows) - 1, anchor + 4)
+
+    # Stop before clearly data-like rows.
+    final_bottom = anchor
+    for i in range(anchor, bottom + 1):
+        vals = [clean_text(v) for v in rows[i] if clean_text(v)]
+        if not vals:
+            final_bottom = i
+            continue
+
+        numeric = 0
+        for v in vals:
+            try:
+                float(v.replace(",", ""))
+                numeric += 1
+            except Exception:
+                pass
+
+        numeric_ratio = numeric / len(vals)
+        if i > anchor and numeric_ratio > 0.45:
+            break
+        final_bottom = i
+
+    return top, final_bottom
+
+
+
+SUMMARY_LABELS = {
+    "tot", "tot.", "total",
+    "avg", "avg.", "average",
+    "max", "max.", "maximum",
+    "min", "min.", "minimum",
+    "mean", "median", "summary"
+}
+
+
+def is_daily_identifier(value) -> bool:
+    """
+    Accept a real Excel date, a date string, or a day-of-month value 1..31.
+    MOR sheets commonly use just 1, 2, 3 ... 31 in the DATE column.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return False
+
+    if isinstance(value, (pd.Timestamp,)):
+        return True
+
+    # Python datetime/date values are recognized by pandas.
+    if not isinstance(value, str):
+        try:
+            num = float(value)
+            return num.is_integer() and 1 <= int(num) <= 31
+        except Exception:
+            pass
+
+    s = clean_text(value)
+    if not s:
+        return False
+
+    if DATE_RE.match(s):
+        return True
+
+    try:
+        num = float(s)
+        return num.is_integer() and 1 <= int(num) <= 31
+    except Exception:
+        return False
+
+
+def row_contains_summary_label(row, look_at=3) -> bool:
+    """
+    Summary rows in MOR workbooks are normally labeled in the first few cells:
+    TOT, AVG., MAX., MIN., etc.
+    """
+    for value in list(row)[:look_at]:
+        label = clean_text(value).lower()
+        if label in SUMMARY_LABELS:
+            return True
+    return False
+
+
+def trim_excel_to_daily_rows(body_rows):
+    """
+    Keep only the monthly daily-data block and discard footer calculations,
+    totals, averages, max/min rows, and unrelated tables below the MOR.
+
+    Strategy:
+      1. Find the first row whose first few cells contain a valid day/date.
+      2. Once daily rows have started, keep rows with a day/date identifier.
+      3. Stop immediately at explicit summary labels such as TOT/AVG/MAX/MIN.
+      4. Also stop after the daily sequence ends, preventing lower tables
+         (for example Total N / Total P summaries) from being imported.
+    """
+    if not body_rows:
+        return body_rows
+
+    kept = []
+    started = False
+    missed_after_start = 0
+
+    for row in body_rows:
+        cells = list(row)
+
+        if started and row_contains_summary_label(cells):
+            break
+
+        # Find a day/date identifier in the first three cells. This handles
+        # sheets with a blank spacer column before DATE.
+        daily = any(is_daily_identifier(v) for v in cells[:3])
+
+        if daily:
+            kept.append(cells)
+            started = True
+            missed_after_start = 0
+            continue
+
+        if started:
+            missed_after_start += 1
+
+            # A single odd/blank row may occur inside some MORs, but two
+            # consecutive non-daily rows means the monthly daily table ended.
+            if missed_after_start >= 2:
+                break
+
+    return kept if kept else body_rows
 
 def dataframe_from_rows(rows, sheet_name, source_name):
     rows = [list(r) for r in rows]
@@ -336,27 +685,41 @@ def dataframe_from_rows(rows, sheet_name, source_name):
     if len(rows) < 2:
         return None
 
-    max_scan = min(12, len(rows))
-    header_idx = max(range(max_scan), key=lambda i: score_header_row(rows[i]))
+    width = max(len(r) for r in rows)
+    rows = [r + [None] * (width - len(r)) for r in rows]
 
-    raw_headers = [clean_text(v) for v in rows[header_idx]]
-    headers = make_unique(raw_headers)
+    header_top, header_bottom = detect_excel_header_band(rows)
+    raw_header_rows = rows[header_top:header_bottom + 1]
+    header_rows = forward_fill_merged_like(raw_header_rows)
 
-    body = rows[header_idx + 1:]
-    width = len(headers)
-    normalized = []
-    for row in body:
-        row = list(row) + [None] * max(0, width - len(row))
-        normalized.append(row[:width])
+    paths = [header_path_for_column(header_rows, c) for c in range(width)]
+    headers = [compact_header_name(path) for path in paths]
+    headers = resolve_duplicate_headers(paths, headers)
+
+    # If everything went wrong, fall back to a single scored row.
+    meaningful = sum(bool(clean_text(h)) and not h.startswith("Detected Column") for h in headers)
+    if meaningful < 2:
+        max_scan = min(12, len(rows))
+        header_idx = max(range(max_scan), key=lambda i: score_header_row(rows[i]))
+        headers = make_unique([clean_text(v) for v in rows[header_idx]])
+        header_bottom = header_idx
+
+    body = rows[header_bottom + 1:]
+
+    # Keep only the actual daily MOR rows. This removes footer calculations
+    # such as TOT / AVG / MAX / MIN and unrelated blocks below the month.
+    body = trim_excel_to_daily_rows(body)
+
+    normalized = [r[:len(headers)] for r in body]
 
     df = pd.DataFrame(normalized, columns=headers).dropna(how="all")
 
+    # Remove columns that are completely blank.
     keep = []
     for c in df.columns:
-        if c.startswith("Detected Column"):
-            series = df[c].fillna("").astype(str).str.strip()
-            if not series.ne("").any():
-                continue
+        series = df[c].fillna("").astype(str).str.strip()
+        if not series.ne("").any():
+            continue
         keep.append(c)
     df = df[keep]
 
@@ -368,18 +731,22 @@ def dataframe_from_rows(rows, sheet_name, source_name):
         source_name=source_name,
         dataframe=df,
         confidence="High",
-        notes=["Read directly from Excel cell structure."],
+        notes=["Multi-row Excel headers were reconstructed from the vertical header hierarchy.", "Footer summary rows such as TOT, AVG, MAX, and MIN are excluded automatically."],
     )
 
 
-def extract_excel(data: bytes, source_name: str) -> list[DetectedDataset]:
+def extract_excel(data: bytes, source_name: str, selected_sheets=None) -> list[DetectedDataset]:
     suffix = Path(source_name).suffix.lower()
     datasets = []
 
     if suffix == ".xls":
-        # Legacy Excel 97-2003 files require xlrd.
         book = pd.ExcelFile(io.BytesIO(data), engine="xlrd")
-        for sheet_name in book.sheet_names:
+        sheet_names = book.sheet_names
+        if selected_sheets is not None:
+            wanted = set(selected_sheets)
+            sheet_names = [s for s in sheet_names if s in wanted]
+
+        for sheet_name in sheet_names:
             raw = pd.read_excel(
                 io.BytesIO(data),
                 sheet_name=sheet_name,
@@ -392,9 +759,12 @@ def extract_excel(data: bytes, source_name: str) -> list[DetectedDataset]:
                 datasets.append(ds)
         return datasets
 
-    # Modern .xlsx / .xlsm files
     wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    wanted = set(selected_sheets) if selected_sheets is not None else None
+
     for ws in wb.worksheets:
+        if wanted is not None and ws.title not in wanted:
+            continue
         rows = [list(r) for r in ws.iter_rows(values_only=True)]
         ds = dataframe_from_rows(rows, ws.title, source_name)
         if ds:
@@ -402,6 +772,21 @@ def extract_excel(data: bytes, source_name: str) -> list[DetectedDataset]:
 
     return datasets
 
+
+
+def get_excel_sheet_names(filename: str, data: bytes) -> list[str]:
+    """Return worksheet names without parsing the sheet contents."""
+    suffix = Path(filename).suffix.lower()
+
+    if suffix == ".xls":
+        book = pd.ExcelFile(io.BytesIO(data), engine="xlrd")
+        return list(book.sheet_names)
+
+    if suffix in {".xlsx", ".xlsm"}:
+        wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+        return list(wb.sheetnames)
+
+    return []
 
 def unpack_upload(filename: str, data: bytes):
     suffix = Path(filename).suffix.lower()
@@ -424,12 +809,12 @@ def unpack_upload(filename: str, data: bytes):
     return []
 
 
-def detect_file(filename: str, data: bytes) -> list[DetectedDataset]:
+def detect_file(filename: str, data: bytes, selected_sheets=None) -> list[DetectedDataset]:
     suffix = Path(filename).suffix.lower()
     if suffix == ".pdf":
         return extract_pdf(data, filename)
     if suffix in {".xls", ".xlsx", ".xlsm"}:
-        return extract_excel(data, filename)
+        return extract_excel(data, filename, selected_sheets=selected_sheets)
     return []
 
 
