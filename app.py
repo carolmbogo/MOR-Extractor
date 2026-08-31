@@ -102,7 +102,7 @@ with st.expander("What changed in V2", expanded=False):
 
 uploads = st.file_uploader(
     "Upload MOR file(s)",
-    type=["pdf", "xlsx", "xlsm", "zip"],
+    type=["pdf","xls","xlsx", "xlsm", "zip"],
     accept_multiple_files=True,
     help="You can upload one month, several months, or a ZIP containing monthly MOR PDFs.",
 )
