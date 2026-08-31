@@ -20,7 +20,7 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
 
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="mm/dd/yyyy") as writer:
-        df.to_excel(writer, sheet_name="Extracted Data", index=False, na_rep="")
+        df.to_excel(writer, sheet_name="Extracted Data", index=False)
 
         workbook = writer.book
         worksheet = writer.sheets["Extracted Data"]
@@ -129,34 +129,155 @@ if uploads:
     # ---------------------------------------------------------------
     # Worksheet selection
     # ---------------------------------------------------------------
-    excel_items = [(name, data) for name, data in items if Path(name).suffix.lower() in {".xls", ".xlsx", ".xlsm"}]
+    excel_items = [
+        (name, data)
+        for name, data in items
+        if Path(name).suffix.lower() in {".xls", ".xlsx", ".xlsm"}
+    ]
     selected_sheets_by_file = {}
 
     if excel_items:
         st.subheader("Choose worksheet(s)")
 
-        for idx, (name, data) in enumerate(excel_items):
-            try:
-                sheet_names = get_excel_sheet_names(name, data)
-            except Exception as exc:
-                st.error(f"Could not read worksheet names from {name}: {exc}")
-                sheet_names = []
+        sheet_lists = {}
+        sheet_errors = []
 
-            if sheet_names:
-                default_sheet = sheet_names[0]
-                # Prefer commonly named MOR/DMR/state tabs when present.
-                preferred = next(
+        for name, data in excel_items:
+            try:
+                sheet_lists[name] = get_excel_sheet_names(name, data)
+            except Exception as exc:
+                sheet_lists[name] = []
+                sheet_errors.append(f"{name}: {exc}")
+
+        for err in sheet_errors:
+            st.error(f"Could not read worksheet names from {err}")
+
+        # Build a case-insensitive map of worksheet names shared by every workbook.
+        common_keys = None
+        display_name_by_key = {}
+
+        for name, sheet_names in sheet_lists.items():
+            current = {}
+            for s in sheet_names:
+                key = s.strip().lower()
+                current[key] = s
+                display_name_by_key.setdefault(key, s)
+
+            keys = set(current)
+            common_keys = keys if common_keys is None else common_keys & keys
+
+        common_keys = common_keys or set()
+        common_options = [display_name_by_key[k] for k in sorted(common_keys)]
+
+        if len(excel_items) > 1 and common_options:
+            preferred = next(
+                (
+                    s for s in common_options
+                    if s.strip().lower() == "state"
+                ),
+                next(
                     (
-                        s for s in sheet_names
+                        s for s in common_options
                         if any(k in s.lower() for k in ("dmr", "mor", "state"))
                     ),
-                    default_sheet,
+                    common_options[0],
+                ),
+            )
+
+            apply_same = st.checkbox(
+                "Use the same worksheet for all uploaded Excel files",
+                value=True,
+                help=(
+                    "Choose one worksheet once and apply it to every uploaded workbook. "
+                    "Turn this off if a particular file needs a different tab."
+                ),
+            )
+
+            if apply_same:
+                chosen_common = st.selectbox(
+                    "Worksheet to use for all files",
+                    options=common_options,
+                    index=common_options.index(preferred),
+                    help="Only worksheets found in every uploaded workbook are listed here.",
+                )
+
+                chosen_key = chosen_common.strip().lower()
+
+                for name, sheet_names in sheet_lists.items():
+                    actual = next(
+                        (s for s in sheet_names if s.strip().lower() == chosen_key),
+                        None,
+                    )
+                    selected_sheets_by_file[name] = [actual] if actual else []
+
+                st.caption(
+                    f'Using "{chosen_common}" for all {len(excel_items)} Excel file(s).'
+                )
+
+            else:
+                st.caption("Choose worksheet(s) separately for each workbook.")
+
+                for idx, (name, data) in enumerate(excel_items):
+                    sheet_names = sheet_lists.get(name, [])
+                    if not sheet_names:
+                        continue
+
+                    default_sheet = sheet_names[0]
+                    preferred_individual = next(
+                        (
+                            s for s in sheet_names
+                            if s.strip().lower() == "state"
+                        ),
+                        next(
+                            (
+                                s for s in sheet_names
+                                if any(k in s.lower() for k in ("dmr", "mor", "state"))
+                            ),
+                            default_sheet,
+                        ),
+                    )
+
+                    selection = st.multiselect(
+                        f"{name}",
+                        options=sheet_names,
+                        default=[preferred_individual],
+                        key=f"sheets_{idx}_{name}",
+                        help="Select one or more tabs for this workbook.",
+                    )
+                    selected_sheets_by_file[name] = selection
+
+        else:
+            # Single Excel file, or multiple workbooks with no shared tab names.
+            if len(excel_items) > 1 and not common_options:
+                st.info(
+                    "These workbooks do not share a common worksheet name, "
+                    "so choose the worksheet separately for each file."
+                )
+
+            for idx, (name, data) in enumerate(excel_items):
+                sheet_names = sheet_lists.get(name, [])
+                if not sheet_names:
+                    continue
+
+                default_sheet = sheet_names[0]
+                preferred_individual = next(
+                    (
+                        s for s in sheet_names
+                        if s.strip().lower() == "state"
+                    ),
+                    next(
+                        (
+                            s for s in sheet_names
+                            if any(k in s.lower() for k in ("dmr", "mor", "state"))
+                        ),
+                        default_sheet,
+                    ),
                 )
 
                 selection = st.multiselect(
                     f"{name}",
                     options=sheet_names,
-                    default=[preferred],
+                    default=[preferred_individual],
                     key=f"sheets_{idx}_{name}",
                     help="Select one or more tabs for the parser to inspect.",
                 )
@@ -269,8 +390,7 @@ if "datasets" in st.session_state:
     preview = df[selected].copy()
 
     st.subheader("3. Preview")
-    display_preview = preview.astype(object).where(pd.notna(preview), "")
-    st.dataframe(display_preview, use_container_width=True, height=500)
+    st.dataframe(preview, use_container_width=True, height=500)
 
     if "Date" in preview.columns:
         valid_dates = pd.to_datetime(preview["Date"], errors="coerce").dropna()
@@ -300,7 +420,7 @@ if "datasets" in st.session_state:
 
     st.download_button(
         "Download CSV",
-        data=preview.to_csv(index=False, na_rep="").encode("utf-8"),
+        data=preview.to_csv(index=False).encode("utf-8"),
         file_name=f"{safe_stem}.csv",
         mime="text/csv",
     )
