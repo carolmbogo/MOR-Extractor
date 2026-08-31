@@ -421,6 +421,90 @@ def apply_real_merged_headers(rows, header_top, header_bottom, merged_ranges):
 
     return header_rows
 
+
+SECTION_FAMILY_MARKERS = (
+    "bod", "c.b.o.d", "cbod",
+    "suspended solid", "settled solid",
+    "ammonia nitrogen", "ammonia",
+    "total nitrogen", "nitrogen",
+    "total phosphorus", "phosphorus",
+    "chlorine", "chlor",
+    "dissolved oxygen",
+    "e. coli", "fecal",
+    "grease", "oil",
+    "ph"
+)
+
+
+def is_section_family_heading(text: str) -> bool:
+    """
+    Return True for upper-level analyte/process family headings that should
+    apply to multiple adjacent subcolumns, such as:
+      5 DAY C.B.O.D.
+      SUSPENDED SOLIDS
+      SETTLED SOLIDS
+      AMMONIA NITROGEN
+    """
+    t = clean_text(text)
+    if not t:
+        return False
+
+    low = t.lower()
+
+    # Avoid treating leaf labels such as "P-Chem INF" or units as section headings.
+    if is_unit(t):
+        return False
+
+    return any(marker in low for marker in SECTION_FAMILY_MARKERS)
+
+
+def propagate_section_family_headings(header_rows):
+    """
+    Carry recognized family headings horizontally across adjacent blank cells
+    in the SAME upper header row until the next nonblank heading begins.
+
+    This is intentionally narrower than a general forward-fill. Only known
+    analyte/process family headings are propagated, so ordinary blank cells
+    remain blank.
+
+    Example:
+        [ "5 DAY C.B.O.D.", "", "", "", "SUSPENDED SOLIDS", "", ... ]
+    becomes:
+        [ "5 DAY C.B.O.D.", "5 DAY C.B.O.D.", "5 DAY C.B.O.D.",
+          "5 DAY C.B.O.D.", "SUSPENDED SOLIDS", "SUSPENDED SOLIDS", ... ]
+
+    That lets all child columns inherit their common family parent.
+    """
+    if not header_rows:
+        return header_rows
+
+    width = max(len(r) for r in header_rows)
+    rows = [list(r) + [""] * (width - len(r)) for r in header_rows]
+
+    for r_idx, row in enumerate(rows):
+        active_family = ""
+
+        for c_idx, value in enumerate(row):
+            val = clean_text(value)
+
+            if val:
+                if is_section_family_heading(val):
+                    active_family = val
+                else:
+                    # A new explicit non-family heading ends the current section
+                    # only when it looks like another upper-level block title.
+                    # Leaf headings lower in the hierarchy usually occupy a
+                    # different row and therefore do not interfere.
+                    active_family = ""
+                continue
+
+            if active_family:
+                row[c_idx] = active_family
+
+        rows[r_idx] = row
+
+    return rows
+
 def header_path_for_column(header_rows, col_idx):
     pieces = []
     for row in header_rows:
@@ -466,12 +550,17 @@ def compact_header_name(path):
         "dissolved oxygen", "fecal", "e. coli", "ph"
     )
 
-    parent = words[0]
-    parent_low = parent.lower()
-    preserve_parent = (
-        parent_low not in structural_groups
-        and any(marker in parent_low for marker in family_markers)
+    family_parent = next(
+        (
+            w for w in words
+            if any(marker in w.lower() for marker in family_markers)
+        ),
+        None,
     )
+
+    parent = family_parent or words[0]
+    parent_low = parent.lower()
+    preserve_parent = family_parent is not None
 
     working = [w for w in words if w.lower() not in structural_groups]
     if not working:
@@ -707,6 +796,11 @@ def dataframe_from_rows(rows, sheet_name, source_name, merged_ranges=None):
     header_rows = apply_real_merged_headers(
         rows, header_top, header_bottom, merged_ranges or []
     )
+
+    # Some legacy MORs use centered headings across blank cells instead of
+    # true Excel merged ranges. Propagate only recognized family headings
+    # (e.g., 5 DAY C.B.O.D., SUSPENDED SOLIDS) across those blank siblings.
+    header_rows = propagate_section_family_headings(header_rows)
 
     paths = [header_path_for_column(header_rows, c) for c in range(width)]
     headers = [compact_header_name(path) for path in paths]
