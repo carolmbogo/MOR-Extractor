@@ -12,7 +12,7 @@ from mor_parser import (
 )
 
 
-APP_TITLE = "MOR Column Extractor V2"
+APP_TITLE = "MOR Column Extractor"
 
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -85,26 +85,15 @@ st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
 st.title(APP_TITLE)
 st.caption(
     "Upload MOR PDFs, Excel workbooks, or a ZIP of monthly reports. "
-    "The app detects the data fields, shows sample values for verification, "
+    "The app detects available data fields, shows sample values for verification, "
     "and exports only the columns you choose."
 )
 
-with st.expander("What changed in V2", expanded=False):
-    st.markdown(
-        """
-        - **No fixed character slicing for the Fourth Creek MOR.** The app uses actual PDF x-coordinates.
-        - **Multi-row MOR headers are presented as clean field names** for the saved Fourth Creek/KUB layout.
-        - **Page 1 DO and Page 2 Secondary System DO are labeled separately.**
-        - **Sample values are shown before export** so you can verify you picked the correct column.
-        - Unknown text-based MOR layouts use a positional fallback and are clearly marked **Review required**.
-        """
-    )
-
 uploads = st.file_uploader(
     "Upload MOR file(s)",
-    type=["pdf","xls","xlsx", "xlsm", "zip"],
+    type=["pdf", "xls", "xlsx", "xlsm", "zip"],
     accept_multiple_files=True,
-    help="You can upload one month, several months, or a ZIP containing monthly MOR PDFs.",
+    help="You can upload one month, several months, or a ZIP containing monthly MOR files.",
 )
 
 if uploads:
@@ -205,8 +194,6 @@ if "datasets" in st.session_state:
         st.info("Choose at least one field above.")
         st.stop()
 
-    # Verification cards are critical: this prevents exporting the wrong DO,
-    # grease, or neighboring field without the user seeing sample values first.
     non_date = [c for c in selected if c != "Date"]
 
     if non_date:
@@ -221,7 +208,6 @@ if "datasets" in st.session_state:
     st.subheader("3. Preview")
     st.dataframe(preview, use_container_width=True, height=500)
 
-    # QA information.
     if "Date" in preview.columns:
         valid_dates = pd.to_datetime(preview["Date"], errors="coerce").dropna()
         if len(valid_dates):
