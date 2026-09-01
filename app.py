@@ -96,6 +96,7 @@ def prepare_items(uploads):
 st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
 
 st.title(APP_TITLE)
+st.caption("Turn messy Monthly Operating Reports into clean, usable data.")
 st.caption(
     "Upload MOR PDFs, Excel workbooks, or a ZIP of monthly reports. "
     "Choose the worksheet when an Excel file has multiple tabs, select the fields you need, "
