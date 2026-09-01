@@ -1,9 +1,11 @@
 
 import io
+import hashlib
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from streamlit_sortables import sort_items
 
 from mor_parser import (
     combine_same_named_datasets,
@@ -21,7 +23,7 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
 
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="mm/dd/yyyy") as writer:
-        df.to_excel(writer, sheet_name="Extracted Data", index=False)
+        df.to_excel(writer, sheet_name="Extracted Data", index=False, na_rep="")
 
         workbook = writer.book
         worksheet = writer.sheets["Extracted Data"]
@@ -436,7 +438,7 @@ if "datasets" in st.session_state:
     for note in ds.notes:
         st.caption(note)
 
-    st.subheader("1. Choose fields")
+    st.subheader("1. Choose and arrange fields")
 
     default = ["Date"] if "Date" in df.columns else []
     selected = st.multiselect(
@@ -444,13 +446,65 @@ if "datasets" in st.session_state:
         options=list(df.columns),
         default=default,
         placeholder="Choose one or more fields",
+        key=f"field_picker_{selected_idx}",
     )
-
-    st.subheader("2. Verify the values")
 
     if not selected:
         st.info("Choose at least one field above.")
         st.stop()
+
+    # Preserve the user's previous drag order for fields that remain selected,
+    # then append newly selected fields at the end.
+    order_state_key = f"field_order_{selected_idx}"
+    previous_order = st.session_state.get(order_state_key, [])
+
+    ordered_selected = [c for c in previous_order if c in selected]
+    ordered_selected.extend(c for c in selected if c not in ordered_selected)
+
+    st.markdown("**Drag fields into the order you want in the exported file:**")
+    st.caption("Grab any field and move it up or down. The preview, Excel, and CSV will follow this order.")
+
+    # Changing the selected field set intentionally creates a fresh sortable
+    # component, which avoids stale component state when fields are added/removed.
+    selection_signature = hashlib.md5(
+        "||".join(sorted(selected)).encode("utf-8")
+    ).hexdigest()[:12]
+
+    sortable_style = """
+    .sortable-component {
+        padding: 0.15rem 0;
+        counter-reset: field-order;
+    }
+    .sortable-item {
+        padding: 0.55rem 0.8rem;
+        margin-bottom: 0.35rem;
+        border-radius: 0.45rem;
+        cursor: grab;
+    }
+    .sortable-item::before {
+        content: counter(field-order) ". ";
+        counter-increment: field-order;
+        font-weight: 700;
+    }
+    """
+
+    selected = sort_items(
+        ordered_selected,
+        header=None,
+        direction="vertical",
+        custom_style=sortable_style,
+        key=f"field_sort_{selected_idx}_{selection_signature}",
+    )
+
+    # Defensive cleanup in case a browser/component refresh returns stale data.
+    selected = [c for c in selected if c in df.columns and c in set(ordered_selected)]
+    for c in ordered_selected:
+        if c not in selected:
+            selected.append(c)
+
+    st.session_state[order_state_key] = selected
+
+    st.subheader("2. Verify the values")
 
     non_date = [c for c in selected if c != "Date"]
 
@@ -494,7 +548,7 @@ if "datasets" in st.session_state:
 
     st.download_button(
         "Download CSV",
-        data=preview.to_csv(index=False).encode("utf-8"),
+        data=preview.to_csv(index=False, na_rep="").encode("utf-8"),
         file_name=f"{safe_stem}.csv",
         mime="text/csv",
     )
