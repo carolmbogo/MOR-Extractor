@@ -19,11 +19,39 @@ from mor_parser import (
 APP_TITLE = "MORganizer 3000"
 
 
+def is_percentage_column(column_name: str) -> bool:
+    """Recognize headers that explicitly identify the field as a percentage."""
+    name = str(column_name).strip().lower()
+    return (
+        "%" in name
+        or "percent" in name
+        or "percentage" in name
+    )
+
+
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
 
+    # Excel stores 75.6% as 0.756. MOR source tables commonly store that same
+    # value as 75.6. Convert only the Excel-export copy so the workbook displays
+    # 75.6%, not 7560%, while leaving the app's extracted data unchanged.
+    export_df = df.copy()
+
+    percentage_columns = [
+        col for col in export_df.columns
+        if is_percentage_column(col)
+    ]
+
+    for col in percentage_columns:
+        numeric = pd.to_numeric(export_df[col], errors="coerce")
+        nonblank = export_df[col].notna() & export_df[col].astype(str).str.strip().ne("")
+        numeric_mask = nonblank & numeric.notna()
+
+        # Preserve blanks and any nonnumeric OCR text exactly as-is.
+        export_df.loc[numeric_mask, col] = numeric.loc[numeric_mask] / 100.0
+
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="mm/dd/yyyy") as writer:
-        df.to_excel(writer, sheet_name="Extracted Data", index=False, na_rep="")
+        export_df.to_excel(writer, sheet_name="Extracted Data", index=False, na_rep="")
 
         workbook = writer.book
         worksheet = writer.sheets["Extracted Data"]
@@ -40,24 +68,28 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
             }
         )
         date_fmt = workbook.add_format({"num_format": "mm/dd/yyyy"})
+        percent_fmt = workbook.add_format({"num_format": "0.0%"})
 
-        for col_idx, col in enumerate(df.columns):
+        for col_idx, col in enumerate(export_df.columns):
             worksheet.write(0, col_idx, col, header)
             sample = [str(x) for x in df[col].head(80).fillna("").tolist()]
             width = min(max([len(str(col))] + [len(x) for x in sample]) + 2, 38)
             worksheet.set_column(col_idx, col_idx, max(width, 12))
-            if pd.api.types.is_datetime64_any_dtype(df[col]):
+
+            if pd.api.types.is_datetime64_any_dtype(export_df[col]):
                 worksheet.set_column(col_idx, col_idx, max(width, 12), date_fmt)
+            elif is_percentage_column(col):
+                worksheet.set_column(col_idx, col_idx, max(width, 12), percent_fmt)
 
         worksheet.set_row(0, 38)
         worksheet.freeze_panes(1, 0)
 
-        if len(df) and len(df.columns):
+        if len(export_df) and len(export_df.columns):
             worksheet.add_table(
                 0,
                 0,
-                len(df),
-                len(df.columns) - 1,
+                len(export_df),
+                len(export_df.columns) - 1,
                 {
                     "name": "MORExtractedData",
                     "columns": [{"header": c} for c in df.columns],
