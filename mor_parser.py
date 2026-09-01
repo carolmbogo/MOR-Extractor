@@ -313,9 +313,598 @@ def extract_generic_pdf(data: bytes, source_name: str) -> list[DetectedDataset]:
     return datasets
 
 
-def extract_pdf(data: bytes, source_name: str) -> list[DetectedDataset]:
+
+# ----------------------------
+# Scanned PDF / OCR logic
+# ----------------------------
+
+MONTH_LOOKUP = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+}
+
+
+def get_pdf_page_info(data: bytes) -> dict:
+    """
+    Lightweight PDF inspection used by the Streamlit UI before extraction.
+    A PDF is considered scanned/image-based when almost no embedded text is
+    available on the first few pages.
+    """
+    import fitz
+
+    doc = fitz.open(stream=data, filetype="pdf")
+    page_count = len(doc)
+    sample_pages = min(page_count, 3)
+    text_chars = 0
+
+    for i in range(sample_pages):
+        try:
+            text_chars += len((doc[i].get_text("text") or "").strip())
+        except Exception:
+            pass
+
+    doc.close()
+
+    return {
+        "page_count": page_count,
+        "is_scanned": text_chars < 80,
+        "suggested_pages": [1] if page_count else [],
+    }
+
+
+def _ocr_page_words(page, zoom=2.0):
+    """Render one PDF page and OCR it while preserving word coordinates."""
+    import fitz
+    import pytesseract
+    from PIL import Image
+
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    mode = "RGB" if pix.n == 3 else "RGBA"
+    image = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+    if mode == "RGBA":
+        image = image.convert("RGB")
+
+    ocr = pytesseract.image_to_data(
+        image,
+        config="--psm 6",
+        output_type=pytesseract.Output.DATAFRAME,
+    )
+
+    words = []
+    for _, row in ocr.iterrows():
+        text = clean_text(row.get("text"))
+        if not text:
+            continue
+
+        try:
+            conf = float(row.get("conf", -1))
+        except Exception:
+            conf = -1
+
+        if conf < 10:
+            continue
+
+        left = float(row["left"])
+        top = float(row["top"])
+        width = float(row["width"])
+        height = float(row["height"])
+
+        # Ignore common table-line OCR artifacts.
+        if text in {"|", "||", "_", "__", "___", "{", "}", "[", "]"}:
+            continue
+
+        words.append(
+            {
+                "text": text,
+                "x0": left,
+                "x1": left + width,
+                "top": top,
+                "bottom": top + height,
+                "cx": left + width / 2.0,
+                "cy": top + height / 2.0,
+                "conf": conf,
+            }
+        )
+
+    return words, pix.width, pix.height
+
+
+def _infer_month_year(words, source_name=""):
+    text = " ".join(w["text"] for w in sorted(words, key=lambda x: (x["top"], x["x0"]))).lower()
+
+    for name, month in MONTH_LOOKUP.items():
+        m = re.search(rf"\b{name}\s+(20\d{{2}})\b", text)
+        if m:
+            return month, int(m.group(1))
+
+    # Abbreviated month fallback.
+    for name, month in MONTH_LOOKUP.items():
+        m = re.search(rf"\b{name[:3]}\.?\s+(20\d{{2}})\b", text)
+        if m:
+            return month, int(m.group(1))
+
+    # Common MOR filename fallback, e.g. "... MOR 07 26.pdf".
+    stem = Path(source_name).stem
+    matches = re.findall(r"(?<!\d)(0?[1-9]|1[0-2])[ _-](\d{2}|20\d{2})(?!\d)", stem)
+    if matches:
+        mm, yy = matches[-1]
+        year = int(yy)
+        if year < 100:
+            year += 2000
+        return int(mm), year
+
+    return None, None
+
+
+def _daily_candidate(text):
+    t = clean_text(text)
+    if DATE_RE.match(t):
+        dt = pd.to_datetime(t, errors="coerce")
+        if not pd.isna(dt):
+            return int(dt.day)
+    if re.fullmatch(r"\d{1,2}", t):
+        day = int(t)
+        if 1 <= day <= 31:
+            return day
+    return None
+
+
+def _fit_daily_row_centers(words, page_width):
+    """
+    Find the day/date column and fit a straight line through the daily rows.
+    This is intentionally tolerant of missed OCR days and stray numeric OCR.
+    """
+    candidates = []
+    for w in words:
+        # Daily identifiers should live near the left edge of the MOR table.
+        if w["cx"] > page_width * 0.125:
+            continue
+        day = _daily_candidate(w["text"])
+        if day is not None:
+            candidates.append((day, w["cy"], w["cx"], w["text"]))
+
+    if len(candidates) < 4:
+        return None
+
+    best = None
+    n = len(candidates)
+
+    # Robust two-point model selection. A true MOR daily sequence has nearly
+    # constant vertical spacing, while other numbers in the left margin do not.
+    for i in range(n):
+        d1, y1, _, _ = candidates[i]
+        for j in range(i + 1, n):
+            d2, y2, _, _ = candidates[j]
+            if abs(d2 - d1) < 3:
+                continue
+
+            slope = (y2 - y1) / (d2 - d1)
+            if not (8 <= slope <= 55):
+                continue
+
+            intercept = y1 - slope * d1
+            tol = max(4.0, abs(slope) * 0.28)
+
+            inliers = {}
+            residual_sum = 0.0
+            for day, y, x, raw in candidates:
+                residual = abs(y - (intercept + slope * day))
+                if residual <= tol:
+                    if day not in inliers or residual < inliers[day][0]:
+                        inliers[day] = (residual, y, x, raw)
+
+            score = len(inliers)
+            if score:
+                residual_sum = sum(v[0] for v in inliers.values()) / score
+
+            model = (score, -residual_sum, slope, intercept, inliers)
+            if best is None or model[:2] > best[:2]:
+                best = model
+
+    if best is None or best[0] < 4:
+        return None
+
+    _, _, slope, intercept, inliers = best
+
+    # Refit using all inliers for a cleaner row-spacing estimate.
+    xs = []
+    ys = []
+    for day, (_, y, _, _) in inliers.items():
+        xs.append(float(day))
+        ys.append(float(y))
+
+    if len(xs) >= 2:
+        xbar = sum(xs) / len(xs)
+        ybar = sum(ys) / len(ys)
+        denom = sum((x - xbar) ** 2 for x in xs)
+        if denom:
+            slope = sum((x - xbar) * (y - ybar) for x, y in zip(xs, ys)) / denom
+            intercept = ybar - slope * xbar
+
+    return {
+        "slope": slope,
+        "intercept": intercept,
+        "inliers": inliers,
+        "candidate_count": len(candidates),
+    }
+
+
+def _cluster_supported_x(points, tolerance, min_support=2):
+    """
+    Cluster repeated x-centers and retain positions seen in multiple daily rows.
+    points is a list of (x, row_number).
+    """
+    if not points:
+        return []
+
+    points = sorted(points, key=lambda t: t[0])
+    clusters = []
+
+    for x, row_num in points:
+        if not clusters:
+            clusters.append({"xs": [x], "rows": {row_num}})
+            continue
+
+        center = sum(clusters[-1]["xs"]) / len(clusters[-1]["xs"])
+        if abs(x - center) <= tolerance:
+            clusters[-1]["xs"].append(x)
+            clusters[-1]["rows"].add(row_num)
+        else:
+            clusters.append({"xs": [x], "rows": {row_num}})
+
+    kept = []
+    for c in clusters:
+        if len(c["rows"]) >= min_support:
+            kept.append(sum(c["xs"]) / len(c["xs"]))
+
+    return kept
+
+
+def _group_words_into_lines(words, tolerance=7.0):
+    rows = []
+    for w in sorted(words, key=lambda x: (x["cy"], x["x0"])):
+        if not rows or abs(w["cy"] - rows[-1]["cy"]) > tolerance:
+            rows.append({"cy": w["cy"], "words": [w]})
+        else:
+            rows[-1]["words"].append(w)
+            rows[-1]["cy"] = sum(x["cy"] for x in rows[-1]["words"]) / len(rows[-1]["words"])
+
+    for row in rows:
+        row["words"] = sorted(row["words"], key=lambda x: x["x0"])
+    return rows
+
+
+def _ocr_header_name(anchor_idx, anchors, header_words):
+    anchor = anchors[anchor_idx]
+    left = -1e9 if anchor_idx == 0 else (anchors[anchor_idx - 1] + anchor) / 2.0
+    right = 1e9 if anchor_idx == len(anchors) - 1 else (anchor + anchors[anchor_idx + 1]) / 2.0
+
+    lines = _group_words_into_lines(header_words, tolerance=8.0)
+    pieces = []
+
+    for line in lines:
+        text = " ".join(
+            clean_text(w["text"])
+            for w in line["words"]
+            if left <= w["cx"] < right and clean_text(w["text"])
+        )
+        text = clean_text(text)
+        if text and text not in pieces:
+            pieces.append(text)
+
+    if not pieces:
+        return ""
+
+    # Keep the most useful lower-level header pieces while avoiding a huge title.
+    useful = []
+    for p in pieces:
+        low = p.lower()
+        if any(skip in low for skip in ("operations report", "permit", "city of", "report of operation")):
+            continue
+        useful.append(p)
+
+    useful = useful[-4:] if useful else pieces[-3:]
+    compact = compact_header_name(useful)
+    return compact or clean_text(" ".join(useful))
+
+
+
+def _looks_like_scanned_kub(words):
+    text = " ".join(clean_text(w["text"]) for w in words).lower()
+    score = sum(
+        term in text
+        for term in (
+            "fourth creek",
+            "report of operation",
+            "5-day",
+            "final effluent",
+            "secondary system",
+        )
+    )
+    return score >= 2
+
+
+def _extract_scanned_known_kub(words, page_width, source_name, page_no, model):
+    """
+    Use the saved Fourth Creek/KUB column anchors even when the PDF page is a scan.
+    The anchor positions are scaled to the rendered page width.
+    """
+    import calendar
+
+    text = " ".join(clean_text(w["text"]) for w in words).lower()
+    if "secondary system" in text:
+        field_defs = KUB_PAGE2_FIELDS
+        dataset_name = f"Secondary System - Scanned Page {page_no}"
+    else:
+        field_defs = KUB_PAGE1_FIELDS
+        dataset_name = f"Daily MOR - Scanned Page {page_no}"
+
+    month, year = _infer_month_year(words, source_name=source_name)
+    if month and year:
+        n_days = calendar.monthrange(year, month)[1]
+    else:
+        observed = sorted(model["inliers"])
+        n_days = min(max(max(observed) if observed else 31, 28), 31)
+
+    slope = model["slope"]
+    intercept = model["intercept"]
+    half_band = max(4.5, abs(slope) * 0.36)
+
+    # KUB saved anchors are in the source page's 1224-point coordinate system.
+    scale = page_width / 1224.0
+    scaled_fields = [(name, x * scale) for name, x in field_defs]
+    tolerance = 18.5 * scale
+
+    records = []
+    for day in range(1, n_days + 1):
+        cy = intercept + slope * day
+        record = {name: None for name, _ in field_defs}
+
+        if month and year:
+            record["Date"] = pd.Timestamp(year=year, month=month, day=day)
+
+        row_words = [
+            w for w in words
+            if abs(w["cy"] - cy) <= half_band
+        ]
+
+        for w in row_words:
+            text_value = clean_text(w["text"])
+            if not text_value:
+                continue
+
+            x = w["cx"]
+            field = nearest_field(x, scaled_fields, tolerance)
+
+            if not field or field == "Date":
+                continue
+
+            value = parse_value(text_value)
+            if record[field] is None:
+                record[field] = value
+            else:
+                record[field] = clean_text(f"{record[field]} {text_value}")
+
+        records.append(record)
+
+    df = pd.DataFrame(records, columns=[name for name, _ in field_defs])
+
+    keep = ["Date"]
+    for c in df.columns:
+        if c == "Date":
+            continue
+        s = df[c].fillna("").astype(str).str.strip()
+        if s.ne("").any():
+            keep.append(c)
+    df = df[keep]
+
+    return DetectedDataset(
+        name=dataset_name,
+        source_name=source_name,
+        dataframe=df,
+        confidence="OCR - High layout confidence",
+        notes=[
+            f"Scanned Fourth Creek/KUB MOR layout recognized on page {page_no}.",
+            "Saved KUB column positions were scaled to the scanned page, while OCR supplied the cell values.",
+            "OCR can still misread faint individual numbers or symbols, so verify sample values before export.",
+            "Blank source cells remain blank.",
+        ],
+    )
+
+
+def extract_scanned_page(page, page_no, source_name):
+    """
+    OCR one selected scanned page and reconstruct a daily table from repeated
+    row spacing + repeated x positions.
+    """
+    import calendar
+
+    words, page_width, page_height = _ocr_page_words(page, zoom=2.0)
+    if not words:
+        return None
+
+    model = _fit_daily_row_centers(words, page_width)
+    if model is None:
+        return None
+
+    if _looks_like_scanned_kub(words):
+        return _extract_scanned_known_kub(
+            words,
+            page_width,
+            source_name,
+            page_no,
+            model,
+        )
+
+    slope = model["slope"]
+    intercept = model["intercept"]
+
+    month, year = _infer_month_year(words, source_name=source_name)
+    if month and year:
+        number_of_days = calendar.monthrange(year, month)[1]
+    else:
+        observed_days = sorted(model["inliers"])
+        number_of_days = max(observed_days) if observed_days else 31
+        number_of_days = max(number_of_days, 28)
+        number_of_days = min(number_of_days, 31)
+
+    row_centers = {day: intercept + slope * day for day in range(1, number_of_days + 1)}
+    half_band = max(4.5, abs(slope) * 0.36)
+
+    # Gather words by fitted daily row, excluding the first/day column.
+    row_words = {}
+    x_points = []
+
+    for day, cy in row_centers.items():
+        selected = [
+            w for w in words
+            if abs(w["cy"] - cy) <= half_band
+            and w["cx"] > page_width * 0.11
+        ]
+        row_words[day] = selected
+
+        for w in selected:
+            text = clean_text(w["text"])
+            # Ignore obvious non-data line noise.
+            if not text or text in {"-", "—", "=", "+"}:
+                continue
+            x_points.append((w["cx"], day))
+
+    anchors = _cluster_supported_x(
+        x_points,
+        tolerance=max(9.0, page_width * 0.0075),
+        min_support=2,
+    )
+
+    if len(anchors) < 2:
+        return None
+
+    first_row_y = row_centers[1]
+    header_bottom = first_row_y - half_band
+    header_top = max(0.0, first_row_y - abs(slope) * 6.5)
+
+    header_words = [
+        w for w in words
+        if header_top <= w["cy"] < header_bottom
+    ]
+
+    labels = []
+    for idx, anchor in enumerate(anchors):
+        label = _ocr_header_name(idx, anchors, header_words)
+        labels.append(label or f"Detected Column {idx + 1}")
+
+    labels = make_unique(labels)
+
+    records = []
+    for day in range(1, number_of_days + 1):
+        record = {}
+
+        if month and year:
+            record["Date"] = pd.Timestamp(year=year, month=month, day=day)
+        else:
+            record["Day"] = day
+
+        words_this_row = sorted(row_words.get(day, []), key=lambda w: w["x0"])
+
+        for w in words_this_row:
+            x = w["cx"]
+            idx = min(range(len(anchors)), key=lambda i: abs(x - anchors[i]))
+
+            # Use midpoint ownership so a word cannot leak far into a wrong column.
+            left = -1e9 if idx == 0 else (anchors[idx - 1] + anchors[idx]) / 2.0
+            right = 1e9 if idx == len(anchors) - 1 else (anchors[idx] + anchors[idx + 1]) / 2.0
+            if not (left <= x < right):
+                continue
+
+            label = labels[idx]
+            text = clean_text(w["text"])
+            value = parse_value(text)
+
+            if label not in record or record[label] is None:
+                record[label] = value
+            else:
+                # Join split OCR tokens such as "<" + "0.1".
+                record[label] = clean_text(f"{record[label]} {text}")
+
+        records.append(record)
+
+    id_col = "Date" if month and year else "Day"
+    df = pd.DataFrame(records)
+
+    # Keep only columns with at least one nonblank value.
+    keep = [id_col]
+    for c in labels:
+        if c not in df.columns:
+            continue
+        s = df[c].fillna("").astype(str).str.strip()
+        if s.ne("").any():
+            keep.append(c)
+
+    df = df[keep]
+
+    if len(df.columns) < 2:
+        return None
+
+    confidence = "OCR - Review required"
+    notes = [
+        f"Scanned PDF page {page_no} was read with OCR.",
+        "Daily rows were reconstructed from the repeated day/date spacing on the page.",
+        "OCR can misread faint numbers, symbols, or dense multi-row headers. Verify the sample values before export.",
+        "Blank source cells remain blank in the extracted output.",
+    ]
+
+    return DetectedDataset(
+        name=f"Scanned daily table - Page {page_no}",
+        source_name=source_name,
+        dataframe=df,
+        confidence=confidence,
+        notes=notes,
+    )
+
+
+def extract_scanned_pdf(data: bytes, source_name: str, selected_pages=None):
+    """OCR only the pages the user selected."""
+    import fitz
+
+    doc = fitz.open(stream=data, filetype="pdf")
+    page_count = len(doc)
+
+    if selected_pages is None:
+        selected_pages = [1]
+
+    selected = []
+    for p in selected_pages:
+        try:
+            p = int(p)
+        except Exception:
+            continue
+        if 1 <= p <= page_count:
+            selected.append(p)
+
+    out = []
+    for page_no in sorted(set(selected)):
+        ds = extract_scanned_page(doc[page_no - 1], page_no, source_name)
+        if ds:
+            out.append(ds)
+
+    doc.close()
+    return out
+
+
+def extract_pdf(data: bytes, source_name: str, selected_pages=None) -> list[DetectedDataset]:
+    info = get_pdf_page_info(data)
+
+    if info["is_scanned"]:
+        return extract_scanned_pdf(
+            data,
+            source_name,
+            selected_pages=selected_pages or info["suggested_pages"],
+        )
+
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         known = is_kub_fourth_creek(pdf)
+
     return extract_kub_pdf(data, source_name) if known else extract_generic_pdf(data, source_name)
 
 
@@ -939,10 +1528,15 @@ def unpack_upload(filename: str, data: bytes):
     return []
 
 
-def detect_file(filename: str, data: bytes, selected_sheets=None) -> list[DetectedDataset]:
+def detect_file(
+    filename: str,
+    data: bytes,
+    selected_sheets=None,
+    selected_pdf_pages=None,
+) -> list[DetectedDataset]:
     suffix = Path(filename).suffix.lower()
     if suffix == ".pdf":
-        return extract_pdf(data, filename)
+        return extract_pdf(data, filename, selected_pages=selected_pdf_pages)
     if suffix in {".xls", ".xlsx", ".xlsm"}:
         return extract_excel(data, filename, selected_sheets=selected_sheets)
     return []

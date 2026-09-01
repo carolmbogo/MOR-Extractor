@@ -9,6 +9,7 @@ from mor_parser import (
     combine_same_named_datasets,
     detect_file,
     get_excel_sheet_names,
+    get_pdf_page_info,
     unpack_upload,
 )
 
@@ -98,8 +99,8 @@ st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
 st.title(APP_TITLE)
 st.caption("Turn messy Monthly Operating Reports into clean, usable data.")
 st.caption(
-    "Upload MOR PDFs, Excel workbooks, or a ZIP of monthly reports. "
-    "Choose the worksheet when an Excel file has multiple tabs, select the fields you need, "
+    "Upload MOR PDFs, scanned PDFs, Excel workbooks, or a ZIP of monthly reports. "
+    "Choose the worksheet or scanned-PDF page you need, select the fields, "
     "verify the values, and export the result."
 )
 
@@ -289,6 +290,66 @@ if uploads:
             "PDF files do not need a worksheet selection."
         )
 
+    # ---------------------------------------------------------------
+    # Scanned PDF page selection
+    # ---------------------------------------------------------------
+    pdf_items = [
+        (name, data)
+        for name, data in items
+        if Path(name).suffix.lower() == ".pdf"
+    ]
+    selected_pdf_pages_by_file = {}
+
+    scanned_pdf_count = 0
+    if pdf_items:
+        pdf_info_by_file = {}
+
+        for name, data in pdf_items:
+            try:
+                pdf_info_by_file[name] = get_pdf_page_info(data)
+            except Exception as exc:
+                prep_errors.append(f"{name}: could not inspect PDF pages ({exc})")
+
+        scanned_items = [
+            (name, data, pdf_info_by_file[name])
+            for name, data in pdf_items
+            if name in pdf_info_by_file and pdf_info_by_file[name].get("is_scanned")
+        ]
+
+        scanned_pdf_count = len(scanned_items)
+
+        if scanned_items:
+            st.subheader("Choose scanned PDF page(s)")
+            st.info(
+                "Scanned PDF detected. MORganizer 3000 will OCR only the pages you select, "
+                "so supporting lab reports and attachments do not have to be processed."
+            )
+
+            for idx, (name, data, info) in enumerate(scanned_items):
+                page_count = int(info.get("page_count", 0))
+                options = list(range(1, page_count + 1))
+                default_pages = [
+                    p for p in info.get("suggested_pages", [1])
+                    if p in options
+                ] or ([1] if options else [])
+
+                selected_pages = st.multiselect(
+                    f"{name} — {page_count} page(s)",
+                    options=options,
+                    default=default_pages,
+                    key=f"pdf_pages_{idx}_{name}",
+                    help=(
+                        "Select only the page(s) containing the monthly operating table. "
+                        "Page 1 is suggested by default because the primary MOR is commonly first."
+                    ),
+                )
+                selected_pdf_pages_by_file[name] = selected_pages
+
+            st.caption(
+                "OCR preserves word positions so values can be assigned back to table columns. "
+                "Because scans can be faint or skewed, always verify the sample values before export."
+            )
+
     if st.button("Detect MOR Fields", type="primary"):
         datasets = []
         errors = list(prep_errors)
@@ -307,7 +368,19 @@ if uploads:
                     progress.progress(idx / total)
                     continue
 
-                detected = detect_file(name, data, selected_sheets=selected_sheets)
+                selected_pdf_pages = selected_pdf_pages_by_file.get(name)
+
+                if Path(name).suffix.lower() == ".pdf" and selected_pdf_pages == []:
+                    errors.append(f"{name}: no PDF page was selected.")
+                    progress.progress(idx / total)
+                    continue
+
+                detected = detect_file(
+                    name,
+                    data,
+                    selected_sheets=selected_sheets,
+                    selected_pdf_pages=selected_pdf_pages,
+                )
                 if not detected:
                     errors.append(f"{name}: no usable daily table was detected.")
                 datasets.extend(detected)
@@ -334,8 +407,8 @@ if "datasets" in st.session_state:
 
     if not datasets:
         st.error(
-            "No usable daily MOR table was found. If the PDF is a scan/image, "
-            "this version does not OCR it. A text-based PDF or Excel workbook is required."
+            "No usable daily MOR table was found. For a scanned PDF, try selecting the page "
+            "that contains the daily operating table and make sure the day/date column is visible."
         )
         st.stop()
 
