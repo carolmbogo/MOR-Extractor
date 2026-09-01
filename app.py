@@ -105,7 +105,7 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
                 len(export_df.columns) - 1,
                 {
                     "name": "MORExtractedData",
-                    "columns": [{"header": c} for c in df.columns],
+                    "columns": [{"header": c} for c in export_df.columns],
                     "style": "Table Style Medium 2",
                 },
             )
@@ -141,7 +141,7 @@ def prepare_items(uploads):
     return items, errors
 
 
-st.set_page_config(page_title=APP_TITLE, page_icon="morganizer_icon.jpg", layout="wide")
+st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
 
 st.title(APP_TITLE)
 st.caption("Turn messy Monthly Operating Reports into clean, usable data.")
@@ -556,6 +556,139 @@ if uploads:
 
 
 
+
+def make_unique_names(names):
+    """Return nonblank, unique column names while preserving user order."""
+    used = {}
+    result = []
+    for raw in names:
+        name = str(raw or "").strip() or "Unnamed field"
+        count = used.get(name, 0) + 1
+        used[name] = count
+        result.append(name if count == 1 else f"{name} ({count})")
+    return result
+
+
+def numeric_view(series):
+    """Convert values to numeric where possible without changing source data."""
+    return pd.to_numeric(series, errors="coerce")
+
+
+def qa_flags(df, original_names_by_output=None):
+    """
+    Return review-only QA/QC flags.
+    Nothing is auto-corrected.
+    """
+    flags = []
+    original_names_by_output = original_names_by_output or {}
+
+    if "Date" in df.columns:
+        dates = pd.to_datetime(df["Date"], errors="coerce")
+        valid = dates.dropna()
+
+        dup_mask = valid.duplicated(keep=False)
+        if dup_mask.any():
+            dup_dates = sorted(set(valid[dup_mask].dt.strftime("%m/%d/%Y").tolist()))
+            flags.append({
+                "severity": "warning",
+                "field": "Date",
+                "issue": f"Duplicate date(s): {', '.join(dup_dates[:12])}"
+                         + ("…" if len(dup_dates) > 12 else ""),
+                "count": int(dup_mask.sum()),
+            })
+
+        if len(valid) >= 2:
+            normalized = pd.DatetimeIndex(valid.dt.normalize().unique()).sort_values()
+            expected = pd.date_range(normalized.min(), normalized.max(), freq="D")
+            missing = expected.difference(normalized)
+            if len(missing):
+                labels = [d.strftime("%m/%d/%Y") for d in missing[:12]]
+                flags.append({
+                    "severity": "info",
+                    "field": "Date",
+                    "issue": f"Missing daily date(s): {', '.join(labels)}"
+                             + ("…" if len(missing) > 12 else ""),
+                    "count": len(missing),
+                })
+
+        invalid_date_count = int(df["Date"].notna().sum() - dates.notna().sum())
+        if invalid_date_count:
+            flags.append({
+                "severity": "warning",
+                "field": "Date",
+                "issue": f"{invalid_date_count} nonblank value(s) could not be read as dates.",
+                "count": invalid_date_count,
+            })
+
+    for col in df.columns:
+        if col in {"Date", "Day"}:
+            continue
+
+        original = original_names_by_output.get(col, col)
+        name = f"{original} {col}".lower()
+        series = df[col]
+
+        nonblank = series.notna() & series.astype(str).str.strip().ne("")
+        if not nonblank.any():
+            continue
+
+        numeric = numeric_view(series)
+        numeric_count = int((nonblank & numeric.notna()).sum())
+        nonblank_count = int(nonblank.sum())
+
+        if nonblank_count >= 3 and numeric_count / nonblank_count >= 0.60:
+            bad_text = nonblank & numeric.isna()
+            if bad_text.any():
+                examples = series[bad_text].astype(str).head(5).tolist()
+                flags.append({
+                    "severity": "warning",
+                    "field": col,
+                    "issue": (
+                        f"{int(bad_text.sum())} text/non-numeric value(s) in an otherwise "
+                        f"numeric column. Examples: {', '.join(examples)}"
+                    ),
+                    "count": int(bad_text.sum()),
+                })
+
+        values = numeric[nonblank & numeric.notna()]
+        if values.empty:
+            continue
+
+        if re.search(r"(^|[^a-z])ph([^a-z]|$)", name):
+            bad = values[(values < 0) | (values > 14)]
+            if len(bad):
+                examples = ", ".join(f"{v:g}" for v in bad.head(5))
+                flags.append({
+                    "severity": "warning",
+                    "field": col,
+                    "issue": f"pH value(s) outside 0–14. Examples: {examples}",
+                    "count": len(bad),
+                })
+
+        if is_percentage_column(original) or is_percentage_column(col):
+            bad = values[(values < 0) | (values > 100)]
+            if len(bad):
+                examples = ", ".join(f"{v:g}" for v in bad.head(5))
+                flags.append({
+                    "severity": "warning",
+                    "field": col,
+                    "issue": f"Percentage value(s) outside 0–100. Examples: {examples}",
+                    "count": len(bad),
+                })
+
+        if re.search(r"\bdo\b", name) or "dissolved oxygen" in name:
+            bad = values[(values < 0) | (values > 30)]
+            if len(bad):
+                examples = ", ".join(f"{v:g}" for v in bad.head(5))
+                flags.append({
+                    "severity": "warning",
+                    "field": col,
+                    "issue": f"DO value(s) below 0 or above 30 mg/L. Examples: {examples}",
+                    "count": len(bad),
+                })
+
+    return flags
+
 def sanitize_download_name(name: str, fallback: str = "MOR_extracted") -> str:
     """
     Make a user-entered download filename safe across common operating systems.
@@ -843,16 +976,108 @@ if "datasets" in st.session_state:
         preview = preview.sort_values("Day", kind="stable").reset_index(drop=True)
 
     # ------------------------------------------------------------------
+    # Rename output columns
+    # ------------------------------------------------------------------
+    st.subheader("2. Rename output columns")
+    st.caption(
+        "Optional: change the names that will appear in the exported file. "
+        "The extracted values are not changed."
+    )
+
+    original_columns = list(preview.columns)
+    requested_names = []
+
+    with st.expander("Rename selected fields", expanded=False):
+        for idx, col in enumerate(original_columns):
+            if col in {"Date", "Day"}:
+                requested_names.append(col)
+                st.text_input(
+                    f"Original: {col}",
+                    value=col,
+                    disabled=True,
+                    key=f"rename_output_{idx}_{col}",
+                )
+                continue
+
+            requested_names.append(
+                st.text_input(
+                    f"Original: {col}",
+                    value=col,
+                    key=f"rename_output_{idx}_{col}",
+                )
+            )
+
+    unique_names = make_unique_names(requested_names)
+    renamed_from = {
+        new: old for old, new in zip(original_columns, unique_names)
+    }
+
+    duplicate_adjustments = [
+        (requested, unique)
+        for requested, unique in zip(requested_names, unique_names)
+        if str(requested).strip() and str(requested).strip() != unique
+    ]
+    if duplicate_adjustments:
+        st.warning(
+            "Two or more output fields were given the same name. "
+            "MORganizer added numbers such as “(2)” so every exported column stays unique."
+        )
+
+    preview = preview.copy()
+    preview.columns = unique_names
+
+    # ------------------------------------------------------------------
+    # QA/QC review
+    # ------------------------------------------------------------------
+    st.subheader("3. Data quality review")
+    st.caption(
+        "MORganizer only flags values that deserve a second look. "
+        "It never changes or corrects the extracted data automatically."
+    )
+
+    flags = qa_flags(preview, original_names_by_output=renamed_from)
+
+    if flags:
+        warning_count = sum(1 for f in flags if f["severity"] == "warning")
+        info_count = sum(1 for f in flags if f["severity"] == "info")
+
+        if warning_count:
+            st.warning(
+                f"{warning_count} potential data-quality issue"
+                f"{'s' if warning_count != 1 else ''} found. Review before export."
+            )
+        elif info_count:
+            st.info(
+                f"{info_count} date-completeness note"
+                f"{'s' if info_count != 1 else ''} found."
+            )
+
+        with st.expander(f"Review {len(flags)} QA/QC flag(s)", expanded=True):
+            for flag in flags:
+                icon = "⚠️" if flag["severity"] == "warning" else "ℹ️"
+                st.markdown(f"{icon} **{flag['field']}** — {flag['issue']}")
+    else:
+        st.success("No obvious QA/QC issues were detected in the selected output.")
+
+    # ------------------------------------------------------------------
     # Verification
     # ------------------------------------------------------------------
-    st.subheader("2. Verify the values")
+    st.subheader("4. Verify sample values")
 
     for col in preview.columns:
         if col in {"Date", "Day"}:
             continue
+
         values = sample_values(preview[col], 8)
         shown = " • ".join(values) if values else "No nonblank sample values detected"
-        st.markdown(f"**{col}**")
+        original = renamed_from.get(col, col)
+
+        if original != col:
+            st.markdown(f"**{col}**")
+            st.caption(f"Original MOR header: {original}")
+        else:
+            st.markdown(f"**{col}**")
+
         st.code(shown, language=None)
 
     if len(participating) > 1:
@@ -870,7 +1095,7 @@ if "datasets" in st.session_state:
     # ------------------------------------------------------------------
     # Preview + export
     # ------------------------------------------------------------------
-    st.subheader("3. Preview")
+    st.subheader("5. Preview")
     display_preview = preview.astype(object).where(pd.notna(preview), "")
     st.dataframe(display_preview, use_container_width=True, height=500)
 
@@ -885,7 +1110,7 @@ if "datasets" in st.session_state:
     blank_cells = int(preview.isna().sum().sum())
     st.caption(f"Blank cells in selected output: {blank_cells:,}")
 
-    st.subheader("4. Export")
+    st.subheader("6. Export")
 
     default_stem = "MOR_extracted"
     if len(uploads) == 1:
