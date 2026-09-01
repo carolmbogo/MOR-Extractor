@@ -122,6 +122,15 @@ if uploads:
         st.session_state.pop("errors", None)
         st.session_state.pop("prepared_items", None)
 
+        for key in list(st.session_state.keys()):
+            if (
+                key.startswith("selected_fields_dataset_")
+                or key.startswith("picker_widget_dataset_")
+                or key.startswith("global_field_sort_")
+                or key in {"global_field_order", "active_dataset_for_field_selection"}
+            ):
+                st.session_state.pop(key, None)
+
     if "prepared_items" not in st.session_state:
         items, prep_errors = prepare_items(uploads)
         st.session_state["prepared_items"] = items
@@ -416,58 +425,131 @@ if "datasets" in st.session_state:
 
     st.success(f"Detected {len(datasets)} data set(s).")
 
-    labels = [
+    # ------------------------------------------------------------------
+    # Multi-page / multi-sheet field selection
+    # ------------------------------------------------------------------
+    st.subheader("1. Choose fields from any page or worksheet")
+    st.caption(
+        "Pick a page or worksheet, choose the fields you want, then switch to another one. "
+        "Your earlier selections stay saved."
+    )
+
+    dataset_labels = [
         f"{ds.name} • {len(ds.dataframe):,} rows • {len(ds.dataframe.columns)} fields • {ds.confidence}"
         for ds in datasets
     ]
 
-    selected_idx = st.selectbox(
-        "Choose the detected table you want to extract from",
+    active_idx = st.selectbox(
+        "Page / worksheet to choose fields from",
         options=range(len(datasets)),
-        format_func=lambda i: labels[i],
+        format_func=lambda i: dataset_labels[i],
+        key="active_dataset_for_field_selection",
     )
 
-    ds = datasets[selected_idx]
-    df = ds.dataframe.copy()
+    active_ds = datasets[active_idx]
+    active_df = active_ds.dataframe.copy()
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("Rows detected", f"{len(df):,}")
-    col2.metric("Fields detected", len(df.columns))
-    col3.metric("Confidence", ds.confidence)
+    col1.metric("Rows detected", f"{len(active_df):,}")
+    col2.metric("Fields detected", len(active_df.columns))
+    col3.metric("Confidence", active_ds.confidence)
 
-    for note in ds.notes:
+    for note in active_ds.notes:
         st.caption(note)
 
-    st.subheader("1. Choose and arrange fields")
+    selection_key = f"selected_fields_dataset_{active_idx}"
+    if selection_key not in st.session_state:
+        if "Date" in active_df.columns:
+            st.session_state[selection_key] = ["Date"]
+        elif "Day" in active_df.columns:
+            st.session_state[selection_key] = []
+        else:
+            st.session_state[selection_key] = []
 
-    default = ["Date"] if "Date" in df.columns else []
-    selected = st.multiselect(
-        "Detected fields",
-        options=list(df.columns),
-        default=default,
+    picked_here = st.multiselect(
+        f"Fields from {active_ds.name}",
+        options=list(active_df.columns),
+        default=st.session_state[selection_key],
         placeholder="Choose one or more fields",
-        key=f"field_picker_{selected_idx}",
+        key=f"picker_widget_dataset_{active_idx}",
     )
+    st.session_state[selection_key] = picked_here
 
-    if not selected:
-        st.info("Choose at least one field above.")
+    # Collect selections from every page/sheet.
+    selected_specs = []
+    raw_name_counts = {}
+
+    for ds_idx, ds in enumerate(datasets):
+        chosen = st.session_state.get(f"selected_fields_dataset_{ds_idx}", [])
+        for field in chosen:
+            if field not in ds.dataframe.columns:
+                continue
+            uid = f"{ds_idx}::{field}"
+            selected_specs.append(
+                {
+                    "uid": uid,
+                    "dataset_idx": ds_idx,
+                    "field": field,
+                    "source": ds.name,
+                }
+            )
+            raw_name_counts[field] = raw_name_counts.get(field, 0) + 1
+
+    if not selected_specs:
+        st.info("Choose at least one field from one of the detected pages or worksheets.")
         st.stop()
 
-    # Preserve the user's previous drag order for fields that remain selected,
-    # then append newly selected fields at the end.
-    order_state_key = f"field_order_{selected_idx}"
-    previous_order = st.session_state.get(order_state_key, [])
+    key_fields = {"Date", "Day"}
+    display_for_uid = {}
+    uid_for_display = {}
 
-    ordered_selected = [c for c in previous_order if c in selected]
-    ordered_selected.extend(c for c in selected if c not in ordered_selected)
+    for spec in selected_specs:
+        field = spec["field"]
+        source = spec["source"]
 
-    st.markdown("**Drag fields into the order you want in the exported file:**")
-    st.caption("Grab any field and move it up or down. The preview, Excel, and CSV will follow this order.")
+        if field in key_fields:
+            display = field
+        elif raw_name_counts.get(field, 0) > 1:
+            display = f"{field}  ·  {source}"
+        else:
+            display = field
 
-    # Changing the selected field set intentionally creates a fresh sortable
-    # component, which avoids stale component state when fields are added/removed.
+        base_display = display
+        counter = 2
+        while display in uid_for_display and uid_for_display[display] != spec["uid"]:
+            display = f"{base_display} ({counter})"
+            counter += 1
+
+        display_for_uid[spec["uid"]] = display
+        uid_for_display[display] = spec["uid"]
+
+    # Keep Date/Day only once in the global reorder list even if selected on
+    # several pages/sheets.
+    sortable_uids = []
+    seen_global_keys = set()
+    for spec in selected_specs:
+        if spec["field"] in key_fields:
+            global_key = spec["field"]
+            if global_key in seen_global_keys:
+                continue
+            seen_global_keys.add(global_key)
+        sortable_uids.append(spec["uid"])
+
+    selected_uid_set = set(sortable_uids)
+    previous_global_order = st.session_state.get("global_field_order", [])
+    ordered_uids = [uid for uid in previous_global_order if uid in selected_uid_set]
+    ordered_uids.extend(uid for uid in sortable_uids if uid not in ordered_uids)
+
+    ordered_display = [display_for_uid[uid] for uid in ordered_uids]
+
+    st.markdown("**Selected across all pages / worksheets**")
+    st.caption(
+        "Drag the fields below into the exact order you want. "
+        "Fields from different pages or worksheets can be mixed freely."
+    )
+
     selection_signature = hashlib.md5(
-        "||".join(sorted(selected)).encode("utf-8")
+        "||".join(sorted(selected_uid_set)).encode("utf-8")
     ).hexdigest()[:12]
 
     sortable_style = """
@@ -488,37 +570,141 @@ if "datasets" in st.session_state:
     }
     """
 
-    selected = sort_items(
-        ordered_selected,
+    sorted_display = sort_items(
+        ordered_display,
         header=None,
         direction="vertical",
         custom_style=sortable_style,
-        key=f"field_sort_{selected_idx}_{selection_signature}",
+        key=f"global_field_sort_{selection_signature}",
     )
 
-    # Defensive cleanup in case a browser/component refresh returns stale data.
-    selected = [c for c in selected if c in df.columns and c in set(ordered_selected)]
-    for c in ordered_selected:
-        if c not in selected:
-            selected.append(c)
+    sorted_uids = []
+    for label in sorted_display:
+        uid = uid_for_display.get(label)
+        if uid and uid in selected_uid_set and uid not in sorted_uids:
+            sorted_uids.append(uid)
 
-    st.session_state[order_state_key] = selected
+    for uid in ordered_uids:
+        if uid not in sorted_uids:
+            sorted_uids.append(uid)
 
+    st.session_state["global_field_order"] = sorted_uids
+
+    # ------------------------------------------------------------------
+    # Combine fields from multiple pages/sheets into one daily table
+    # ------------------------------------------------------------------
+    selected_by_dataset = {}
+    for uid in sorted_uids:
+        ds_idx_str, field = uid.split("::", 1)
+        ds_idx = int(ds_idx_str)
+        selected_by_dataset.setdefault(ds_idx, [])
+        if field not in selected_by_dataset[ds_idx]:
+            selected_by_dataset[ds_idx].append(field)
+
+    participating = sorted(selected_by_dataset)
+
+    def choose_join_key(indices):
+        if indices and all("Date" in datasets[i].dataframe.columns for i in indices):
+            return "Date"
+        if indices and all("Day" in datasets[i].dataframe.columns for i in indices):
+            return "Day"
+        return None
+
+    join_key = choose_join_key(participating)
+    merged = None
+    column_for_uid = {}
+
+    for ds_idx in participating:
+        ds = datasets[ds_idx]
+        source_df = ds.dataframe.copy()
+        chosen_fields = selected_by_dataset[ds_idx]
+
+        work_cols = list(chosen_fields)
+        if join_key and join_key in source_df.columns and join_key not in work_cols:
+            work_cols = [join_key] + work_cols
+
+        part = source_df[work_cols].copy()
+
+        rename_map = {}
+        for field in chosen_fields:
+            uid = f"{ds_idx}::{field}"
+
+            if field == join_key:
+                column_for_uid[uid] = join_key
+                continue
+
+            output_name = display_for_uid[uid]
+            rename_map[field] = output_name
+            column_for_uid[uid] = output_name
+
+        part = part.rename(columns=rename_map)
+
+        if merged is None:
+            merged = part
+        elif join_key:
+            merged = merged.merge(part, on=join_key, how="outer", sort=False)
+        else:
+            merged = pd.concat(
+                [merged.reset_index(drop=True), part.reset_index(drop=True)],
+                axis=1,
+            )
+
+    if merged is None:
+        st.info("Choose at least one field.")
+        st.stop()
+
+    final_columns = []
+    for uid in sorted_uids:
+        _, field = uid.split("::", 1)
+
+        if field in key_fields:
+            if field in merged.columns and field not in final_columns:
+                final_columns.append(field)
+            continue
+
+        col_name = column_for_uid.get(uid)
+        if col_name in merged.columns and col_name not in final_columns:
+            final_columns.append(col_name)
+
+    preview = merged[final_columns].copy()
+
+    if join_key == "Date" and "Date" in preview.columns:
+        preview["Date"] = pd.to_datetime(preview["Date"], errors="coerce")
+        preview = preview.sort_values("Date", kind="stable").reset_index(drop=True)
+    elif join_key == "Day" and "Day" in preview.columns:
+        preview = preview.sort_values("Day", kind="stable").reset_index(drop=True)
+
+    # ------------------------------------------------------------------
+    # Verification
+    # ------------------------------------------------------------------
     st.subheader("2. Verify the values")
 
-    non_date = [c for c in selected if c != "Date"]
+    for col in preview.columns:
+        if col in {"Date", "Day"}:
+            continue
+        values = sample_values(preview[col], 8)
+        shown = " • ".join(values) if values else "No nonblank sample values detected"
+        st.markdown(f"**{col}**")
+        st.code(shown, language=None)
 
-    if non_date:
-        for field in non_date:
-            values = sample_values(df[field], 8)
-            shown = " • ".join(values) if values else "No nonblank sample values detected"
-            st.markdown(f"**{field}**")
-            st.code(shown, language=None)
+    if len(participating) > 1:
+        if join_key:
+            st.caption(
+                f"Fields from {len(participating)} detected pages/worksheets were combined using "
+                f"{join_key} so values stay on the correct daily row."
+            )
+        else:
+            st.warning(
+                "These selected tables do not share a Date or Day field, so MORganizer aligned "
+                "them by row position. Verify the preview carefully before export."
+            )
 
-    preview = df[selected].copy()
-
+    # ------------------------------------------------------------------
+    # Preview + export
+    # ------------------------------------------------------------------
     st.subheader("3. Preview")
-    st.dataframe(preview, use_container_width=True, height=500)
+    display_preview = preview.astype(object).where(pd.notna(preview), "")
+    st.dataframe(display_preview, use_container_width=True, height=500)
 
     if "Date" in preview.columns:
         valid_dates = pd.to_datetime(preview["Date"], errors="coerce").dropna()
