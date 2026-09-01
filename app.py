@@ -1,6 +1,7 @@
 
 import io
 import hashlib
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -17,6 +18,18 @@ from mor_parser import (
 
 
 APP_TITLE = "MORganizer 3000"
+
+
+class StoredUpload:
+    """Small UploadedFile-compatible wrapper for files kept across upload batches."""
+
+    def __init__(self, name: str, data: bytes):
+        self.name = name
+        self._data = data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
 
 
 def is_percentage_column(column_name: str) -> bool:
@@ -138,15 +151,118 @@ st.caption(
     "verify the values, and export the result."
 )
 
-uploads = st.file_uploader(
-    "Upload MOR file(s)",
+# -------------------------------------------------------------------
+# Additive upload queue
+# -------------------------------------------------------------------
+# Streamlit can accept many files at once, but this queue also lets the user
+# add another batch later without losing files that were already chosen.
+if "stored_uploads" not in st.session_state:
+    st.session_state["stored_uploads"] = []
+
+if "uploader_generation" not in st.session_state:
+    st.session_state["uploader_generation"] = 0
+
+new_uploads = st.file_uploader(
+    "Choose MOR file(s) to add",
     type=["pdf", "xls", "xlsx", "xlsm", "zip"],
     accept_multiple_files=True,
-    help="You can upload one month, several months, or a ZIP containing monthly MOR files.",
+    help=(
+        "Choose one or more files. After they are added, you can browse again "
+        "and add another batch without losing the files already in MORganizer."
+    ),
+    key=f"mor_upload_batch_{st.session_state['uploader_generation']}",
 )
 
+if new_uploads:
+    if st.button("Add selected files", type="primary", key="add_selected_uploads"):
+        existing_fingerprints = {
+            (item["name"], item["size"], item["sha256"])
+            for item in st.session_state["stored_uploads"]
+        }
+
+        added = 0
+        skipped = 0
+
+        for upload in new_uploads:
+            data = upload.getvalue()
+            fingerprint = (
+                upload.name,
+                len(data),
+                hashlib.sha256(data).hexdigest(),
+            )
+
+            if fingerprint in existing_fingerprints:
+                skipped += 1
+                continue
+
+            st.session_state["stored_uploads"].append(
+                {
+                    "name": upload.name,
+                    "data": data,
+                    "size": len(data),
+                    "sha256": fingerprint[2],
+                }
+            )
+            existing_fingerprints.add(fingerprint)
+            added += 1
+
+        # Reset the native picker so another batch can be chosen immediately.
+        st.session_state["uploader_generation"] += 1
+
+        if added:
+            st.success(f"Added {added} file{'s' if added != 1 else ''}.")
+        if skipped:
+            st.info(
+                f"Skipped {skipped} duplicate file{'s' if skipped != 1 else ''} "
+                "that were already added."
+            )
+
+        st.rerun()
+
+stored = st.session_state["stored_uploads"]
+
+if stored:
+    total_mb = sum(item["size"] for item in stored) / (1024 * 1024)
+    st.caption(
+        f"**{len(stored)} file{'s' if len(stored) != 1 else ''} ready** "
+        f"({total_mb:,.1f} MB total). You can add another batch above at any time."
+    )
+
+    with st.expander("Files currently added", expanded=False):
+        for item in stored:
+            st.write(f"• {item['name']}  —  {item['size'] / (1024 * 1024):,.1f} MB")
+
+        if st.button("Clear all added files", key="clear_all_stored_uploads"):
+            st.session_state["stored_uploads"] = []
+            st.session_state["uploader_generation"] += 1
+
+            for key in [
+                "upload_signature",
+                "datasets",
+                "errors",
+                "prepared_items",
+                "prep_errors",
+            ]:
+                st.session_state.pop(key, None)
+
+            for key in list(st.session_state.keys()):
+                if (
+                    key.startswith("selected_fields_dataset_")
+                    or key.startswith("picker_widget_dataset_")
+                    or key.startswith("global_field_sort_")
+                    or key in {"global_field_order", "active_dataset_for_field_selection"}
+                ):
+                    st.session_state.pop(key, None)
+
+            st.rerun()
+
+uploads = [StoredUpload(item["name"], item["data"]) for item in stored]
+
 if uploads:
-    signature = tuple((u.name, len(u.getvalue())) for u in uploads)
+    signature = tuple(
+        (item["name"], item["size"], item["sha256"])
+        for item in stored
+    )
 
     if st.session_state.get("upload_signature") != signature:
         st.session_state["upload_signature"] = signature
@@ -437,6 +553,26 @@ if uploads:
 
         st.session_state["datasets"] = combine_same_named_datasets(datasets)
         st.session_state["errors"] = errors
+
+
+
+def sanitize_download_name(name: str, fallback: str = "MOR_extracted") -> str:
+    """
+    Make a user-entered download filename safe across common operating systems.
+    Extensions are removed here because the export buttons add .xlsx / .csv.
+    """
+    name = str(name or "").strip()
+
+    # Remove an extension if the user typed one.
+    name = re.sub(r"\.(xlsx|xls|csv)$", "", name, flags=re.IGNORECASE)
+
+    # Replace characters that are invalid or awkward in Windows/macOS filenames.
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
+
+    # Collapse repeated whitespace and trim trailing spaces/dots.
+    name = re.sub(r"\s+", " ", name).strip(" .")
+
+    return name or fallback
 
 
 if "datasets" in st.session_state:
@@ -751,9 +887,21 @@ if "datasets" in st.session_state:
 
     st.subheader("4. Export")
 
-    safe_stem = "MOR_extracted"
+    default_stem = "MOR_extracted"
     if len(uploads) == 1:
-        safe_stem = Path(uploads[0].name).stem + "_extracted"
+        default_stem = Path(uploads[0].name).stem + "_extracted"
+
+    requested_name = st.text_input(
+        "Name your extracted file",
+        value=default_stem,
+        help="You do not need to type .xlsx or .csv. MORganizer will add the correct extension.",
+        key="custom_export_filename",
+    )
+
+    safe_stem = sanitize_download_name(requested_name, fallback=default_stem)
+
+    if requested_name.strip() and safe_stem != requested_name.strip():
+        st.caption(f'Your download filename will be saved as: **{safe_stem}**')
 
     xlsx = to_excel_bytes(preview)
     st.download_button(
