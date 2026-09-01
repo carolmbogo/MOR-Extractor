@@ -13,7 +13,7 @@ from mor_parser import (
 )
 
 
-APP_TITLE = "MOR Column Extractor"
+APP_TITLE = "MORganizer 3000"
 
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
