@@ -141,7 +141,7 @@ def prepare_items(uploads):
     return items, errors
 
 
-st.set_page_config(page_title=APP_TITLE, page_icon="morganizer_icon.png", layout="wide")
+st.set_page_config(page_title=APP_TITLE, page_icon="morganizer_icon.jpg", layout="wide")
 
 st.title(APP_TITLE)
 st.caption("Turn messy Monthly Operating Reports into clean, usable data.")
