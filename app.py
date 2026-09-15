@@ -1,5 +1,7 @@
 
 import io
+import json
+import time
 import hashlib
 import re
 from pathlib import Path
@@ -7,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from streamlit_sortables import sort_items
+from streamlit_local_storage import LocalStorage
 
 from mor_parser import (
     combine_same_named_datasets,
@@ -29,6 +32,93 @@ class StoredUpload:
 
     def getvalue(self) -> bytes:
         return self._data
+
+
+PRESET_STORAGE_KEY = "morganizer_3000_field_presets_v1"
+
+
+def load_presets(local_storage):
+    if st.session_state.get("_presets_loaded"):
+        return
+    raw = local_storage.getItem(PRESET_STORAGE_KEY, key="morganizer_presets_load")
+    if raw is None:
+        raw = st.session_state.get("morganizer_presets_load")
+    if raw:
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, dict):
+                st.session_state["field_presets"] = parsed
+        except Exception:
+            pass
+    st.session_state.setdefault("field_presets", {})
+    st.session_state["_presets_loaded"] = True
+
+
+def persist_presets(local_storage):
+    local_storage.setItem(
+        PRESET_STORAGE_KEY,
+        json.dumps(st.session_state.get("field_presets", {})),
+        key=f"morganizer_presets_save_{time.time_ns()}",
+    )
+
+
+def apply_field_preset(preset, datasets):
+    # Clear current per-dataset picks so the preset becomes the active selection.
+    for key in list(st.session_state):
+        if key.startswith("selected_fields_dataset_") or key.startswith("picker_widget_dataset_"):
+            st.session_state.pop(key, None)
+
+    by_source = {}
+    for idx, ds in enumerate(datasets):
+        by_source.setdefault(str(ds.name).strip().lower(), []).append(idx)
+
+    ordered_uids = []
+    unmatched = []
+
+    for item in preset.get("ordered_fields", []):
+        source = str(item.get("source", "")).strip()
+        field = str(item.get("field", "")).strip()
+        if not field:
+            continue
+
+        matched_idx = None
+
+        # Prefer the same page/worksheet.
+        for idx in by_source.get(source.lower(), []):
+            if field in datasets[idx].dataframe.columns:
+                matched_idx = idx
+                break
+
+        # Fallback when the field occurs in exactly one current dataset.
+        if matched_idx is None:
+            candidates = [
+                idx for idx, ds in enumerate(datasets)
+                if field in ds.dataframe.columns
+            ]
+            if len(candidates) == 1:
+                matched_idx = candidates[0]
+
+        if matched_idx is None:
+            unmatched.append(f"{field} · {source}" if source else field)
+            continue
+
+        selection_key = f"selected_fields_dataset_{matched_idx}"
+        st.session_state.setdefault(selection_key, [])
+        if field not in st.session_state[selection_key]:
+            st.session_state[selection_key].append(field)
+
+        uid = f"{matched_idx}::{field}"
+        if uid not in ordered_uids:
+            ordered_uids.append(uid)
+
+    st.session_state["global_field_order"] = ordered_uids
+
+    # Rebuild the draggable list from the preset order.
+    for key in list(st.session_state):
+        if key.startswith("global_field_sort_"):
+            st.session_state.pop(key, None)
+
+    return unmatched
 
 
 
@@ -145,6 +235,9 @@ st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
 
 st.title(APP_TITLE)
 st.caption("Turn messy Monthly Operating Reports into clean, usable data.")
+
+local_storage = LocalStorage()
+load_presets(local_storage)
 st.caption(
     "Upload MOR PDFs, scanned PDFs, Excel workbooks, or a ZIP of monthly reports. "
     "Choose the worksheet or scanned-PDF page you need, select the fields, "
@@ -740,6 +833,61 @@ if "datasets" in st.session_state:
         for ds in datasets
     ]
 
+    presets = st.session_state.get("field_presets", {})
+
+    with st.expander("Saved field presets", expanded=bool(presets)):
+        st.caption(
+            "Reuse the same selected fields and drag order on later MORs. "
+            "Presets are saved in this browser."
+        )
+
+        if presets:
+            preset_names = sorted(presets, key=str.lower)
+            preset_to_use = st.selectbox(
+                "Preset",
+                preset_names,
+                key="field_preset_to_use",
+            )
+            c1, c2 = st.columns([2, 1])
+
+            if c1.button(
+                "Apply preset",
+                type="primary",
+                use_container_width=True,
+                key="apply_field_preset",
+            ):
+                unmatched = apply_field_preset(presets[preset_to_use], datasets)
+                st.session_state["_preset_apply_result"] = (preset_to_use, unmatched)
+                st.rerun()
+
+            if c2.button(
+                "Delete",
+                use_container_width=True,
+                key="delete_field_preset",
+            ):
+                st.session_state["field_presets"].pop(preset_to_use, None)
+                persist_presets(local_storage)
+                time.sleep(0.35)
+                st.session_state["_preset_deleted"] = preset_to_use
+                st.rerun()
+        else:
+            st.info("No presets saved yet. Select your fields below, arrange them, then save that setup.")
+
+    if "_preset_apply_result" in st.session_state:
+        preset_name, unmatched = st.session_state.pop("_preset_apply_result")
+        if unmatched:
+            st.warning(
+                f'Applied "{preset_name}", but {len(unmatched)} saved field'
+                f'{"s" if len(unmatched) != 1 else ""} were not found in this batch: '
+                + ", ".join(unmatched[:8])
+                + ("…" if len(unmatched) > 8 else "")
+            )
+        else:
+            st.success(f'Applied preset "{preset_name}".')
+
+    if "_preset_deleted" in st.session_state:
+        st.success(f'Deleted preset "{st.session_state.pop("_preset_deleted")}".')
+
     active_idx = st.selectbox(
         "Page / worksheet to choose fields from",
         options=range(len(datasets)),
@@ -757,6 +905,18 @@ if "datasets" in st.session_state:
 
     for note in active_ds.notes:
         st.caption(note)
+
+    if getattr(active_ds, "header_map", None):
+        with st.expander("OCR header interpretations", expanded=False):
+            st.caption(
+                "The cleaned heading comes from the table position and recognized MOR terminology. "
+                "Raw OCR is shown underneath so you can verify what MORganizer interpreted."
+            )
+            for cleaned, raw_ocr in active_ds.header_map.items():
+                if cleaned not in active_df.columns:
+                    continue
+                st.markdown(f"**{cleaned}**")
+                st.caption(f"Raw OCR: {raw_ocr or '(no readable OCR header text)'}")
 
     selection_key = f"selected_fields_dataset_{active_idx}"
     if selection_key not in st.session_state:
@@ -890,6 +1050,54 @@ if "datasets" in st.session_state:
             sorted_uids.append(uid)
 
     st.session_state["global_field_order"] = sorted_uids
+
+    with st.expander("Save current field setup as a preset", expanded=False):
+        st.caption(
+            "This saves the selected fields, the page/worksheet they came from, "
+            "and the exact drag order."
+        )
+        new_preset_name = st.text_input(
+            "Preset name",
+            placeholder="Example: Fourth Creek Calibration",
+            key="new_field_preset_name",
+        )
+
+        if st.button(
+            "Save preset",
+            key="save_field_preset",
+            disabled=not bool(new_preset_name.strip()),
+        ):
+            spec_by_uid = {spec["uid"]: spec for spec in selected_specs}
+            ordered_fields = []
+            seen_key_fields = set()
+
+            for uid in sorted_uids:
+                spec = spec_by_uid.get(uid)
+                if not spec:
+                    continue
+
+                if spec["field"] in key_fields:
+                    if spec["field"] in seen_key_fields:
+                        continue
+                    seen_key_fields.add(spec["field"])
+
+                ordered_fields.append({
+                    "source": spec["source"],
+                    "field": spec["field"],
+                })
+
+            clean_name = new_preset_name.strip()
+            st.session_state.setdefault("field_presets", {})
+            st.session_state["field_presets"][clean_name] = {
+                "ordered_fields": ordered_fields
+            }
+            persist_presets(local_storage)
+            time.sleep(0.35)
+            st.session_state["_preset_saved"] = clean_name
+            st.rerun()
+
+    if "_preset_saved" in st.session_state:
+        st.success(f'Saved field preset "{st.session_state.pop("_preset_saved")}".')
 
     # ------------------------------------------------------------------
     # Combine fields from multiple pages/sheets into one daily table
