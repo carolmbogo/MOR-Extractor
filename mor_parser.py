@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import calendar
 import re
 import zipfile
 from dataclasses import dataclass
@@ -56,6 +57,7 @@ class DetectedDataset:
     dataframe: pd.DataFrame
     confidence: str
     notes: list[str]
+    header_map: dict[str, str] | None = None
 
 
 def clean_text(value) -> str:
@@ -575,38 +577,230 @@ def _group_words_into_lines(words, tolerance=7.0):
     return rows
 
 
-def _ocr_header_name(anchor_idx, anchors, header_words):
-    anchor = anchors[anchor_idx]
-    left = -1e9 if anchor_idx == 0 else (anchors[anchor_idx - 1] + anchor) / 2.0
-    right = 1e9 if anchor_idx == len(anchors) - 1 else (anchor + anchors[anchor_idx + 1]) / 2.0
-
-    lines = _group_words_into_lines(header_words, tolerance=8.0)
-    pieces = []
-
-    for line in lines:
-        text = " ".join(
-            clean_text(w["text"])
-            for w in line["words"]
-            if left <= w["cx"] < right and clean_text(w["text"])
-        )
-        text = clean_text(text)
-        if text and text not in pieces:
-            pieces.append(text)
-
-    if not pieces:
+def _normalize_ocr_header_token(text):
+    """Conservative cleanup of common OCR damage in MOR headings."""
+    text = clean_text(text)
+    if not text:
         return ""
 
-    # Keep the most useful lower-level header pieces while avoiding a huge title.
-    useful = []
-    for p in pieces:
-        low = p.lower()
-        if any(skip in low for skip in ("operations report", "permit", "city of", "report of operation")):
-            continue
-        useful.append(p)
+    text = text.replace("|", " ").replace("_", " ")
+    text = re.sub(r"\s+", " ", text).strip(" []{}()'\"")
 
-    useful = useful[-4:] if useful else pieces[-3:]
-    compact = compact_header_name(useful)
-    return compact or clean_text(" ".join(useful))
+    substitutions = [
+        (r"\bdaly\b", "Daily"),
+        (r"\bdayly\b", "Daily"),
+        (r"\bmak\b", "Max"),
+        (r"\bwin\b", "Min"),
+        (r"\bmgo\b", "MGD"),
+        (r"\bmg0\b", "MGD"),
+        (r"\bmcp\b", "MGD"),
+        (r"\bmga\b", "mg/L"),
+        (r"\bmgl\b", "mg/L"),
+        (r"\bmgr\b", "mg/L"),
+        (r"\bmull\b", "mL/L"),
+        (r"\bremovall?\b", "Removal"),
+        (r"\bp\s*-?\s*chem\b", "P-Chem"),
+        (r"\bpchem\b", "P-Chem"),
+        (r"\binf\b", "Inf."),
+        (r"\beff\b", "Eff."),
+        (r"\bteme\b", "Temp"),
+        (r"\btemp\.\b", "Temp"),
+        (r"\bcount[’']?\b", "Count"),
+    ]
+    for pattern, replacement in substitutions:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+    return clean_text(text)
+
+
+def _looks_numeric_header_noise(text):
+    t = clean_text(text).replace(",", "")
+    return bool(
+        re.fullmatch(r"[<>]?\s*-?\d+(?:\.\d+)?%?", t)
+        or re.fullmatch(r"[<>]?\s*-?\.\d+", t)
+    )
+
+
+def _family_heading_regions(header_words, page_width):
+    """
+    Find major multi-column header families, then divide the header horizontally
+    at midpoints between those detected family headings.
+    """
+    lines = _group_words_into_lines(header_words, tolerance=15.0)
+
+    family_patterns = [
+        ("Plant Influent", re.compile(r"plant\s+influent", re.I)),
+        ("Temperature", re.compile(r"temp", re.I)),
+        ("5 Day C.B.O.D.", re.compile(r"5\s*day\s+c[.\s]*[b8][.\s]*[o0][.\s]*[d0]", re.I)),
+        ("Suspended Solids", re.compile(r"suspended\s+solids", re.I)),
+        ("Settled Solids", re.compile(r"settled\s+solids", re.I)),
+        ("Ammonia Nitrogen", re.compile(r"ammonia\s*nitrogen|ammonianitrogen", re.I)),
+        ("pH", re.compile(r"(^|\s)ph($|\s)", re.I)),
+        ("Final Effluent", re.compile(r"final\s+effluent", re.I)),
+    ]
+
+    hits = []
+
+    for line in lines:
+        words = line["words"]
+        for i in range(len(words)):
+            for j in range(i, min(i + 4, len(words))):
+                chunk = words[i:j + 1]
+                phrase = clean_text(" ".join(_normalize_ocr_header_token(w["text"]) for w in chunk))
+                if not phrase:
+                    continue
+                for family, pattern in family_patterns:
+                    if pattern.search(phrase):
+                        x0 = min(w["x0"] for w in chunk)
+                        x1 = max(w["x1"] for w in chunk)
+                        hits.append((family, (x0 + x1) / 2.0, x0, x1, line["cy"]))
+
+    best = {}
+    for hit in hits:
+        family, center, x0, x1, cy = hit
+        old = best.get(family)
+        if old is None or cy < old[4]:
+            best[family] = hit
+
+    headings = sorted(best.values(), key=lambda h: h[1])
+    regions = []
+
+    for i, (family, center, x0, x1, cy) in enumerate(headings):
+        left = 0.0 if i == 0 else (headings[i - 1][1] + center) / 2.0
+        right = page_width if i == len(headings) - 1 else (center + headings[i + 1][1]) / 2.0
+        regions.append({"family": family, "left": left, "right": right})
+
+    return regions
+
+
+def _family_for_anchor(anchor, family_regions):
+    for region in family_regions:
+        if region["left"] <= anchor < region["right"]:
+            return region["family"]
+    return ""
+
+
+def _canonical_ocr_header(raw_text, family="", column_number=None):
+    """
+    Turn OCR fragments into a clean MOR header when supported by the text and
+    table position. Ambiguous cases are explicitly marked for review.
+    """
+    raw = _normalize_ocr_header_token(raw_text)
+    low = raw.lower()
+
+    # Standalone plant-influent fields.
+    if ("rain" in low or "ran" in low) and ("inch" in low or family == "Plant Influent"):
+        return "Rainfall (in)"
+    if "daily" in low and "flow" in low:
+        return "Daily Flow (MGD)"
+    if "max" in low and "flow" in low:
+        return "Max Flow (MGD)"
+    if "min" in low and "flow" in low:
+        return "Min Flow (MGD)"
+    if "raw" in low and ("temp" in low or "waste" in low):
+        return "Raw Waste Temp (°C)"
+    if "final" in low and "temp" in low:
+        return "Final Eff Temp (°C)"
+
+    # pH.
+    if family == "pH":
+        if "final" in low or "eff" in low:
+            return "pH Final Effluent"
+        if "plant" in low or "inf" in low:
+            return "pH Plant Influent"
+
+    # Final-effluent family.
+    if family == "Final Effluent":
+        if re.search(r"\bdo\b", low):
+            return "Final Effluent DO (mg/L)"
+        if "count" in low or "e-col" in low or "ecoli" in low or "e. coli" in low:
+            return "E. coli (Count/100 mL)"
+        if "daily" in low and "flow" in low:
+            return "Final Effluent Daily Flow (MGD)"
+        if "p-chem" in low and "flow" in low:
+            return "P-Chem Effluent Flow"
+        if "flow" in low and "inf" in low:
+            return "Biological Influent Flow"
+        if "flow" in low and "eff" in low:
+            return "Biological Effluent Flow"
+
+    # Hierarchical analyte/process families.
+    prefix = family if family in {
+        "5 Day C.B.O.D.",
+        "Suspended Solids",
+        "Settled Solids",
+        "Ammonia Nitrogen",
+    } else ""
+
+    if prefix:
+        child = ""
+        unit = "mL/L" if prefix == "Settled Solids" else "mg/L"
+
+        if "p-chem" in low and "removal" in low:
+            child, unit = "P-Chem Removal", "%"
+        elif "p-chem" in low and "eff" in low:
+            child = "P-Chem Eff."
+        elif "p-chem" in low and "inf" in low:
+            child = "P-Chem Inf."
+        elif ("bio" in low or "biological" in low or "logical" in low) and "eff" in low:
+            child = "Biological Eff."
+        elif ("bio" in low or "biological" in low or "logical" in low) and "inf" in low:
+            child = "Biological Inf."
+        elif "plant" in low and ("inf" in low or "influent" in low):
+            child = "Plant Inf."
+        elif "final" in low and ("eff" in low or "effluent" in low):
+            child = "Final Eff."
+        elif "eff" in low:
+            child = "Eff."
+        elif "inf" in low:
+            child = "Inf."
+
+        if child:
+            return f"{prefix} {child} ({unit})"
+
+    # Flow columns elsewhere in the process table.
+    if "flow" in low:
+        if "p-chem" in low and "eff" in low:
+            return "P-Chem Effluent Flow"
+        if "inf" in low:
+            return "Biological Influent Flow"
+        if "eff" in low:
+            return "Biological Effluent Flow"
+
+    number = column_number if column_number is not None else "?"
+    return f"Review column {number}"
+
+
+def _ocr_header_name(anchor_idx, anchors, header_words, page_width=None, family_regions=None):
+    """
+    Read only the OCR words belonging to this physical column region.
+    Returns both the cleaned interpretation and raw OCR text.
+    """
+    anchor = anchors[anchor_idx]
+    left = 0.0 if anchor_idx == 0 else (anchors[anchor_idx - 1] + anchor) / 2.0
+    right = (page_width or 1e9) if anchor_idx == len(anchors) - 1 else (anchor + anchors[anchor_idx + 1]) / 2.0
+
+    lines = _group_words_into_lines(header_words, tolerance=11.0)
+    raw_pieces = []
+
+    for line in lines:
+        tokens = []
+        for word in line["words"]:
+            overlap = max(0.0, min(word["x1"], right) - max(word["x0"], left))
+            width = max(1.0, word["x1"] - word["x0"])
+            if overlap / width >= 0.35 or left <= word["cx"] < right:
+                token = _normalize_ocr_header_token(word["text"])
+                if token and not _looks_numeric_header_noise(token):
+                    tokens.append(token)
+
+        piece = clean_text(" ".join(tokens))
+        if piece and piece not in raw_pieces:
+            raw_pieces.append(piece)
+
+    raw = clean_text(" ".join(raw_pieces[-5:]))
+    family = _family_for_anchor(anchor, family_regions or [])
+    clean = _canonical_ocr_header(raw, family=family, column_number=anchor_idx + 1)
+    return clean, raw
 
 
 
@@ -773,7 +967,7 @@ def extract_scanned_page(page, page_no, source_name):
 
     anchors = _cluster_supported_x(
         x_points,
-        tolerance=max(9.0, page_width * 0.0075),
+        tolerance=max(18.0, page_width * 0.012),
         min_support=2,
     )
 
@@ -781,20 +975,38 @@ def extract_scanned_page(page, page_no, source_name):
         return None
 
     first_row_y = row_centers[1]
-    header_bottom = first_row_y - half_band
-    header_top = max(0.0, first_row_y - abs(slope) * 6.5)
+
+    # Keep day-1 values out of the header OCR. Tesseract boxes can extend well
+    # above the visual baseline, so the old boundary was too close to row 1.
+    header_bottom = first_row_y - max(half_band * 1.4, abs(slope) * 0.62)
+    header_top = max(0.0, first_row_y - abs(slope) * 6.7)
 
     header_words = [
         w for w in words
         if header_top <= w["cy"] < header_bottom
     ]
 
+    family_regions = _family_heading_regions(header_words, page_width)
+
+    raw_headers = []
     labels = []
+
     for idx, anchor in enumerate(anchors):
-        label = _ocr_header_name(idx, anchors, header_words)
-        labels.append(label or f"Detected Column {idx + 1}")
+        clean_label, raw_label = _ocr_header_name(
+            idx,
+            anchors,
+            header_words,
+            page_width=page_width,
+            family_regions=family_regions,
+        )
+        labels.append(clean_label)
+        raw_headers.append(raw_label)
 
     labels = make_unique(labels)
+    normalized_raw_map = {
+        clean_label: (raw_headers[idx] if idx < len(raw_headers) else "")
+        for idx, clean_label in enumerate(labels)
+    }
 
     records = []
     for day in range(1, number_of_days + 1):
@@ -846,13 +1058,22 @@ def extract_scanned_page(page, page_no, source_name):
     if len(df.columns) < 2:
         return None
 
+    review_columns = [c for c in df.columns if str(c).startswith("Review column")]
     confidence = "OCR - Review required"
+
     notes = [
         f"Scanned PDF page {page_no} was read with OCR.",
-        "Daily rows were reconstructed from the repeated day/date spacing on the page.",
-        "OCR can misread faint numbers, symbols, or dense multi-row headers. Verify the sample values before export.",
+        "Daily rows were reconstructed from repeated day/date spacing.",
+        "Multi-row headings are reconstructed from the physical column region, header family, and recognized unit.",
+        "Ambiguous OCR headings are labeled 'Review column …' instead of being shown as confident field names.",
         "Blank source cells remain blank in the extracted output.",
     ]
+
+    if review_columns:
+        notes.append(
+            f"{len(review_columns)} ambiguous header(s) still need manual naming. "
+            "Use Rename output columns before export."
+        )
 
     return DetectedDataset(
         name=f"Scanned daily table - Page {page_no}",
@@ -860,6 +1081,7 @@ def extract_scanned_page(page, page_no, source_name):
         dataframe=df,
         confidence=confidence,
         notes=notes,
+        header_map=normalized_raw_map,
     )
 
 
@@ -1372,6 +1594,151 @@ def trim_excel_to_daily_rows(body_rows):
 
     return kept if kept else body_rows
 
+
+MONTH_LOOKUP = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2,
+    "mar": 3, "march": 3, "apr": 4, "april": 4, "may": 5,
+    "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+
+def _normalize_year_token(token):
+    try:
+        year = int(token)
+    except Exception:
+        return None
+    if 0 <= year <= 79:
+        return 2000 + year
+    if 80 <= year <= 99:
+        return 1900 + year
+    if 1900 <= year <= 2100:
+        return year
+    return None
+
+
+def parse_month_year_from_filename(source_name):
+    """Read a MOR month/year from common filename styles."""
+    text = re.sub(r"[_]+", " ", Path(source_name).stem)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    month_names = "|".join(sorted(MONTH_LOOKUP.keys(), key=len, reverse=True))
+    m = re.search(
+        rf"(?i)\b({month_names})\b[\s._-]*(\d{{2}}|\d{{4}})\b",
+        text,
+    )
+    if m:
+        month = MONTH_LOOKUP[m.group(1).lower()]
+        year = _normalize_year_token(m.group(2))
+        if year:
+            return month, year
+
+    # Numeric forms are accepted only when MOR is adjacent to the pair.
+    for pattern in [
+        r"(?i)\bMOR\b[\s._-]*(0?[1-9]|1[0-2])[\s._-]+(\d{2}|\d{4})\b",
+        r"(?i)\bMOR[\s._-]+(0?[1-9]|1[0-2])[\s._-]+(\d{2}|\d{4})\b",
+        r"(?i)\b(0?[1-9]|1[0-2])[\s._-]+(\d{2}|\d{4})[\s._-]*MOR\b",
+    ]:
+        m = re.search(pattern, text)
+        if m:
+            year = _normalize_year_token(m.group(2))
+            if year:
+                return int(m.group(1)), year
+
+    return None
+
+
+def _day_number(value):
+    """Return 1..31 only when the source value is a day-of-month number."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(value, pd.Timestamp):
+        return None
+
+    text = clean_text(value)
+    if not text or DATE_RE.match(text):
+        return None
+
+    try:
+        num = float(text)
+    except Exception:
+        return None
+
+    return int(num) if num.is_integer() and 1 <= int(num) <= 31 else None
+
+
+def find_day_number_column(df):
+    """Find the source DAY column without using measurement completeness."""
+    for col in df.columns:
+        label = clean_text(col).lower()
+        if label in {"day", "date"} or re.search(r"\bday\b", label):
+            valid = [_day_number(v) for v in df[col].tolist()]
+            if sum(v is not None for v in valid) >= 2:
+                return col
+
+    # Fallback for imperfectly reconstructed headers.
+    for col in list(df.columns)[:3]:
+        valid = [v for v in (_day_number(x) for x in df[col].tolist()) if v is not None]
+        if len(valid) < 3:
+            continue
+        increasing = sum(1 for a, b in zip(valid, valid[1:]) if b > a)
+        if increasing >= max(1, len(valid) - 2):
+            return col
+
+    return None
+
+
+def apply_filename_calendar(df, source_name):
+    """
+    Create authoritative dates from filename month/year + source DAY.
+
+    Measurement blanks never remove a valid date. Impossible template days
+    such as June 31 are ignored rather than shifting later data.
+    """
+    parsed = parse_month_year_from_filename(source_name)
+    if not parsed:
+        return df, None
+
+    month, year = parsed
+    day_col = find_day_number_column(df)
+    if day_col is None:
+        return df, None
+
+    max_day = calendar.monthrange(year, month)[1]
+    source_days = df[day_col].map(_day_number)
+
+    valid_mask = source_days.notna() & source_days.between(1, max_day)
+    work = df.loc[valid_mask].copy()
+    source_days = source_days.loc[valid_mask].astype(int)
+
+    if work.empty:
+        return df, None
+
+    work = work.drop(columns=[day_col])
+    work.insert(
+        0,
+        "Date",
+        [pd.Timestamp(year=year, month=month, day=int(day)) for day in source_days],
+    )
+    work = work.reset_index(drop=True)
+
+    return work, {
+        "month": month,
+        "year": year,
+        "days_in_month": max_day,
+        "rows_mapped": len(work),
+        "source_day_column": str(day_col),
+    }
+
+
 def dataframe_from_rows(rows, sheet_name, source_name, merged_ranges=None):
     rows = [list(r) for r in rows]
     rows = [r for r in rows if any(clean_text(v) for v in r)]
@@ -1425,12 +1792,35 @@ def dataframe_from_rows(rows, sheet_name, source_name, merged_ranges=None):
     if df.empty or len(df.columns) < 2:
         return None
 
+    df, calendar_info = apply_filename_calendar(df, source_name)
+
+    notes = [
+        "Multi-row Excel headers were reconstructed from the vertical header hierarchy.",
+        "Footer summary rows such as TOT, AVG, MAX, and MIN are excluded automatically.",
+    ]
+
+    if calendar_info:
+        month_name = calendar.month_name[calendar_info["month"]]
+        notes.append(
+            f"Calendar alignment: filename identified {month_name} {calendar_info['year']}; "
+            "source DAY values were mapped directly to real dates."
+        )
+        notes.append(
+            f"{month_name} {calendar_info['year']} has {calendar_info['days_in_month']} valid days. "
+            "Impossible template rows are ignored, while valid days remain even when measurement cells are blank."
+        )
+    else:
+        notes.append(
+            "Calendar alignment was not applied because MORganizer could not confidently identify "
+            "both the filename month/year and a numeric DAY column."
+        )
+
     return DetectedDataset(
         name=f"Excel sheet: {sheet_name}",
         source_name=source_name,
         dataframe=df,
         confidence="High",
-        notes=["Multi-row Excel headers were reconstructed from the vertical header hierarchy.", "Footer summary rows such as TOT, AVG, MAX, and MIN are excluded automatically."],
+        notes=notes,
     )
 
 
@@ -1564,5 +1954,6 @@ def combine_same_named_datasets(datasets: list[DetectedDataset]):
             dataframe=combined,
             confidence=members[0].confidence,
             notes=members[0].notes + [f"Combined {len(members)} matching files."],
+            header_map=members[0].header_map,
         ))
     return out
