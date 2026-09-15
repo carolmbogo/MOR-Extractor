@@ -1363,30 +1363,42 @@ if "datasets" in st.session_state:
     if len(uploads) == 1:
         default_stem = Path(uploads[0].name).stem + "_extracted"
 
+    # Keep the export name in its own persistent state. This avoids a Streamlit
+    # rerun falling back to MOR_extracted between editing the text box and
+    # clicking a download button.
+    if "export_filename_committed" not in st.session_state:
+        st.session_state["export_filename_committed"] = default_stem
+
     requested_name = st.text_input(
         "Name your extracted file",
-        value=default_stem,
+        value=st.session_state["export_filename_committed"],
         help="You do not need to type .xlsx or .csv. MORganizer will add the correct extension.",
         key="custom_export_filename",
     )
 
+    # The current text-box value is authoritative on every rerun.
     safe_stem = sanitize_download_name(requested_name, fallback=default_stem)
+    st.session_state["export_filename_committed"] = safe_stem
 
     if requested_name.strip() and safe_stem != requested_name.strip():
         st.caption(f'Your download filename will be saved as: **{safe_stem}**')
+
+    st.caption(f'Excel download: **{safe_stem}.xlsx**')
 
     xlsx = to_excel_bytes(preview)
     st.download_button(
         "Download Excel",
         data=xlsx,
-        file_name=f"{safe_stem}.xlsx",
+        file_name=safe_stem + ".xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
+        key="download_excel_custom_name",
     )
 
     st.download_button(
         "Download CSV",
         data=preview.to_csv(index=False, na_rep="").encode("utf-8"),
-        file_name=f"{safe_stem}.csv",
+        file_name=safe_stem + ".csv",
         mime="text/csv",
+        key="download_csv_custom_name",
     )
