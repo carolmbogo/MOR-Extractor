@@ -38,28 +38,54 @@ PRESET_STORAGE_KEY = "morganizer_3000_field_presets_v1"
 
 
 def load_presets(local_storage):
+    """
+    Load saved presets from browser storage.
+
+    Browser storage is optional: if the component is unavailable or its API
+    changes, MORganizer continues running with session-only presets.
+    """
     if st.session_state.get("_presets_loaded"):
         return
-    raw = local_storage.getItem(PRESET_STORAGE_KEY, key="morganizer_presets_load")
-    if raw is None:
-        raw = st.session_state.get("morganizer_presets_load")
+
+    raw = None
+    try:
+        # streamlit-local-storage accepts the storage key as its positional arg.
+        raw = local_storage.getItem(PRESET_STORAGE_KEY)
+    except Exception:
+        st.session_state["_preset_storage_available"] = False
+
     if raw:
         try:
             parsed = json.loads(raw) if isinstance(raw, str) else raw
             if isinstance(parsed, dict):
                 st.session_state["field_presets"] = parsed
         except Exception:
+            # A damaged/old browser value must never stop the app.
             pass
+
     st.session_state.setdefault("field_presets", {})
+    st.session_state.setdefault("_preset_storage_available", True)
     st.session_state["_presets_loaded"] = True
 
 
 def persist_presets(local_storage):
-    local_storage.setItem(
-        PRESET_STORAGE_KEY,
-        json.dumps(st.session_state.get("field_presets", {})),
-        key=f"morganizer_presets_save_{time.time_ns()}",
-    )
+    """
+    Save presets when browser storage is available.
+    Failure falls back to the current Streamlit session instead of crashing.
+    """
+    payload = json.dumps(st.session_state.get("field_presets", {}))
+
+    if local_storage is None:
+        st.session_state["_preset_storage_available"] = False
+        return False
+
+    try:
+        local_storage.setItem(PRESET_STORAGE_KEY, payload)
+        st.session_state["_preset_storage_available"] = True
+        return True
+    except Exception:
+        st.session_state["_preset_storage_available"] = False
+        return False
 
 
 def apply_field_preset(preset, datasets):
@@ -236,8 +262,15 @@ st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
 st.title(APP_TITLE)
 st.caption("Turn messy Monthly Operating Reports into clean, usable data.")
 
-local_storage = LocalStorage()
-load_presets(local_storage)
+try:
+    local_storage = LocalStorage()
+    load_presets(local_storage)
+except Exception:
+    local_storage = None
+    st.session_state.setdefault("field_presets", {})
+    st.session_state["_presets_loaded"] = True
+    st.session_state["_preset_storage_available"] = False
+
 st.caption(
     "Upload MOR PDFs, scanned PDFs, Excel workbooks, or a ZIP of monthly reports. "
     "Choose the worksheet or scanned-PDF page you need, select the fields, "
@@ -836,10 +869,16 @@ if "datasets" in st.session_state:
     presets = st.session_state.get("field_presets", {})
 
     with st.expander("Saved field presets", expanded=bool(presets)):
-        st.caption(
-            "Reuse the same selected fields and drag order on later MORs. "
-            "Presets are saved in this browser."
-        )
+        if st.session_state.get("_preset_storage_available", True):
+            st.caption(
+                "Reuse the same selected fields and drag order on later MORs. "
+                "Presets are saved in this browser."
+            )
+        else:
+            st.caption(
+                "Presets work for this session. Browser saving is temporarily unavailable, "
+                "but the rest of MORganizer is unaffected."
+            )
 
         if presets:
             preset_names = sorted(presets, key=str.lower)
