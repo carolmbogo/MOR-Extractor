@@ -480,11 +480,6 @@ if uploads:
         )
 
         st.subheader("Choose PDF page(s)")
-        st.info(
-            "MORganizer supports text-based PDFs, Excel files, and ZIP files containing "
-            "those formats. Physical PDF pages stay separate and all pages are selected "
-            "by default. Scanned/image-only PDFs are skipped because OCR is disabled."
-        )
 
         for idx, (name, data) in enumerate(pdf_items):
             if name not in pdf_info_by_file:
@@ -516,11 +511,6 @@ if uploads:
                 ),
             )
             selected_pdf_pages_by_file[name] = selected_pages
-
-        st.caption(
-            "Text PDFs are parsed page-by-page. Parent and child table headers are "
-            "reconstructed from the native PDF text geometry."
-        )
 
     if st.button("Detect MOR Fields", type="primary"):
         datasets = []
