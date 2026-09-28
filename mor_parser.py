@@ -323,41 +323,103 @@ def _median_anchor_gap(anchors):
     gaps=sorted(gaps)
     return gaps[len(gaps)//2]
 
-def _phrase_bands_for_row(row, anchors):
-    """
-    Map one visual header row to the columns below it.
+def _column_bounds(anchors, idx):
+    anchor = anchors[idx]
+    left = -1e9 if idx == 0 else (anchors[idx-1] + anchor) / 2.0
+    right = 1e9 if idx == len(anchors)-1 else (anchor + anchors[idx+1]) / 2.0
+    return left, right
 
-    Sparse intermediate headings (e.g. NH3-N above only Comp.) are local and
-    cannot spread across unrelated pH/Influent columns. Rows with several
-    headings use whitespace boundaries between their actual text boxes.
+def _map_child_row(row, anchors):
     """
-    phrases=_group_row_phrases(row)
-    if not phrases: return {}
-    mapped={}
-    gap=_median_anchor_gap(anchors)
+    Bottom-up assignment: establish the child label belonging to each detected
+    data column before applying any broad parent heading.
+    """
+    phrases = _group_row_phrases(row)
+    mapped = {}
+    for j, anchor in enumerate(anchors):
+        left, right = _column_bounds(anchors, j)
+        candidates = []
+        for p in phrases:
+            overlap = max(0.0, min(p["x1"], right) - max(p["x0"], left))
+            width = max(1.0, p["x1"] - p["x0"])
+            if overlap / width >= 0.30 or left <= p["xc"] <= right:
+                candidates.append((abs(p["xc"] - anchor), p))
+        if candidates:
+            mapped[j] = min(candidates, key=lambda x: x[0])[1]["text"]
+    return mapped
 
-    if len(phrases)==1:
-        p=phrases[0]
-        # Local influence for a lone sub-heading. The expansion is enough to
-        # catch centered child columns but not enough to claim the whole table.
-        pad=max(14.0,min(0.75*gap,32.0))
-        left=p["x0"]-pad; right=p["x1"]+pad
-        candidates=[(j,a) for j,a in enumerate(anchors) if left <= a <= right]
-        if not candidates:
-            j,a=min(enumerate(anchors),key=lambda ja:abs(ja[1]-p["xc"]))
-            if abs(a-p["xc"]) <= max(22.0,gap):
-                candidates=[(j,a)]
-        for j,_ in candidates:
-            mapped[j]=p["text"]
+def _map_parent_row(row, anchors):
+    """
+    Map broad MOR section headings after child columns are established.
+
+    Ownership follows the visual starts of consecutive parent headings. This
+    better matches underlined MOR bands than center-to-center splitting and
+    prevents a later heading from stealing the last child of the prior group.
+    """
+    phrases = _group_row_phrases(row)
+    if not phrases:
+        return {}
+
+    gap = _median_anchor_gap(anchors)
+    mapped = {}
+
+    if len(phrases) == 1:
+        p = phrases[0]
+        # A single broad heading may span several children around its text.
+        left = p["x0"] - max(gap, 18.0)
+        right = p["x1"] + max(2.0 * gap, 36.0)
+        for j, anchor in enumerate(anchors):
+            if left <= anchor <= right:
+                mapped[j] = p["text"]
         return mapped
 
-    for i,p in enumerate(phrases):
-        left=-1e9 if i==0 else (phrases[i-1]["x1"]+p["x0"])/2
-        right=1e9 if i==len(phrases)-1 else (p["x1"]+phrases[i+1]["x0"])/2
-        for j,a in enumerate(anchors):
-            if left <= a <= right:
-                mapped[j]=p["text"]
+    for i, p in enumerate(phrases):
+        # Do not extend the first parent all the way to the page edge; this
+        # keeps standalone Date outside the first process family.
+        left = (
+            p["x0"] - min(max(0.65 * gap, 12.0), 24.0)
+            if i == 0 else p["x0"]
+        )
+
+        if i < len(phrases) - 1:
+            # The next heading's visual start is the ownership boundary.
+            right = phrases[i+1]["x0"]
+        else:
+            right = p["x1"] + max(3.0 * gap, 54.0)
+
+        for j, anchor in enumerate(anchors):
+            if left <= anchor < right:
+                mapped[j] = p["text"]
+
     return mapped
+
+def _map_subparent_row(row, anchors):
+    phrases = _group_row_phrases(row)
+    if not phrases:
+        return {}
+
+    gap = _median_anchor_gap(anchors)
+    mapped = {}
+    claimed = set()
+
+    for p in phrases:
+        ranked = sorted(
+            enumerate(anchors),
+            key=lambda ja: abs(ja[1] - p["xc"])
+        )
+        for j, anchor in ranked:
+            if j in claimed:
+                continue
+            if abs(anchor - p["xc"]) <= max(1.15 * gap, 24.0):
+                mapped[j] = p["text"]
+                claimed.add(j)
+            break
+
+    return mapped
+
+
+def _phrase_bands_for_row(row, anchors, role="parent"):
+    return _map_child_row(row, anchors) if role == "child" else _map_parent_row(row, anchors)
 
 def _clean_header_path(parts):
     cleaned=[]
@@ -374,15 +436,52 @@ def _clean_header_path(parts):
 
 def build_hierarchical_pdf_headers(anchors, header_rows):
     """
-    Build Parent -> Sub-parent -> Child paths from native PDF geometry.
-    Uncertain columns are named Review Column N rather than guessed.
+    Column-first native PDF header reconstruction.
+
+    The lowest header row is assigned to physical data columns first.
+    The top row supplies broad process/parameter parents.
+    Any rows between them are local sub-headings attached only to the nearest
+    established column. This prevents NH3-N, MLSS, Return, or 30 Min from
+    leaking sideways into neighboring columns.
     """
-    if not anchors: return []
-    row_maps=[_phrase_bands_for_row(row,anchors) for row in header_rows]
-    names=[]
-    for j,_ in enumerate(anchors):
-        path=_clean_header_path([m.get(j,"") for m in row_maps])
-        names.append(" ".join(path).strip() if path else f"Review Column {j+1}")
+    if not anchors:
+        return []
+
+    usable_rows = [r for r in header_rows if _group_row_phrases(r)]
+    if not usable_rows:
+        return make_unique([f"Review Column {i+1}" for i in range(len(anchors))])
+
+    child_map = _map_child_row(usable_rows[-1], anchors)
+
+    broad_parent_map = {}
+    sub_maps = []
+    if len(usable_rows) >= 2:
+        broad_parent_map = _map_parent_row(usable_rows[0], anchors)
+    if len(usable_rows) > 2:
+        sub_maps = [_map_subparent_row(r, anchors) for r in usable_rows[1:-1]]
+
+    names = []
+    for j, _ in enumerate(anchors):
+        child = _norm_header(child_map.get(j, ""))
+
+        if child.lower() == "date":
+            names.append("Date")
+            continue
+
+        parent = _norm_header(broad_parent_map.get(j, ""))
+        subs = [_norm_header(m.get(j, "")) for m in sub_maps]
+        pieces = [parent] + subs + ([child] if child else [])
+        path = _clean_header_path(
+            [p for p in pieces if p and not _is_metadata_text(p)]
+        )
+
+        if not child:
+            names.append(f"Review Column {j+1}")
+        elif path:
+            names.append(" ".join(path))
+        else:
+            names.append(f"Review Column {j+1}")
+
     return make_unique(names)
 
 
@@ -497,12 +596,7 @@ def extract_generic_page(page, page_no: int, source_name: str) -> DetectedDatase
         source_name=source_name,
         dataframe=df,
         confidence="Review required",
-        notes=[
-            f"Extracted strictly from physical PDF page {page_no}.",
-            "Multi-level headers were reconstructed from native PDF text geometry.",
-            "Selected physical PDF pages are kept separate and never silently dropped.",
-            "Confirm sample values before exporting.",
-        ],
+        notes=[f"Native PDF page {page_no}."],
     )
 
 

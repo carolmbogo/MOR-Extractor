@@ -1,7 +1,5 @@
 
 import io
-import json
-import time
 import hashlib
 import re
 from pathlib import Path
@@ -9,7 +7,6 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from streamlit_sortables import sort_items
-from streamlit_local_storage import LocalStorage
 
 from mor_parser import (
     DetectedDataset,
@@ -33,201 +30,6 @@ class StoredUpload:
 
     def getvalue(self) -> bytes:
         return self._data
-
-
-PRESET_STORAGE_KEY = "morganizer_3000_field_presets_v1"
-
-
-def load_presets(local_storage):
-    """
-    Load saved presets from browser storage.
-
-    Browser storage is optional: if the component is unavailable or its API
-    changes, MORganizer continues running with session-only presets.
-    """
-    if st.session_state.get("_presets_loaded"):
-        return
-
-    raw = None
-    try:
-        # streamlit-local-storage accepts the storage key as its positional arg.
-        raw = local_storage.getItem(PRESET_STORAGE_KEY)
-    except Exception:
-        st.session_state["_preset_storage_available"] = False
-
-    if raw:
-        try:
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(parsed, dict):
-                st.session_state["field_presets"] = parsed
-        except Exception:
-            # A damaged/old browser value must never stop the app.
-            pass
-
-    st.session_state.setdefault("field_presets", {})
-    st.session_state.setdefault("_preset_storage_available", True)
-    st.session_state["_presets_loaded"] = True
-
-
-def persist_presets(local_storage):
-    """
-    Save presets when browser storage is available.
-    Failure falls back to the current Streamlit session instead of crashing.
-    """
-    payload = json.dumps(st.session_state.get("field_presets", {}))
-
-    if local_storage is None:
-        st.session_state["_preset_storage_available"] = False
-        return False
-
-    try:
-        local_storage.setItem(PRESET_STORAGE_KEY, payload)
-        st.session_state["_preset_storage_available"] = True
-        return True
-    except Exception:
-        st.session_state["_preset_storage_available"] = False
-        return False
-
-
-def apply_field_preset(preset, datasets):
-    # Clear current per-dataset picks so the preset becomes the active selection.
-    for key in list(st.session_state):
-        if key.startswith("selected_fields_dataset_") or key.startswith("picker_widget_dataset_"):
-            st.session_state.pop(key, None)
-
-    by_source = {}
-    for idx, ds in enumerate(datasets):
-        by_source.setdefault(str(ds.name).strip().lower(), []).append(idx)
-
-    ordered_uids = []
-    unmatched = []
-
-    for item in preset.get("ordered_fields", []):
-        source = str(item.get("source", "")).strip()
-        field = str(item.get("field", "")).strip()
-        if not field:
-            continue
-
-        matched_idx = None
-
-        # Prefer the same page/worksheet.
-        for idx in by_source.get(source.lower(), []):
-            if field in datasets[idx].dataframe.columns:
-                matched_idx = idx
-                break
-
-        # Fallback when the field occurs in exactly one current dataset.
-        if matched_idx is None:
-            candidates = [
-                idx for idx, ds in enumerate(datasets)
-                if field in ds.dataframe.columns
-            ]
-            if len(candidates) == 1:
-                matched_idx = candidates[0]
-
-        if matched_idx is None:
-            unmatched.append(f"{field} · {source}" if source else field)
-            continue
-
-        selection_key = f"selected_fields_dataset_{matched_idx}"
-        st.session_state.setdefault(selection_key, [])
-        if field not in st.session_state[selection_key]:
-            st.session_state[selection_key].append(field)
-
-        uid = f"{matched_idx}::{field}"
-        if uid not in ordered_uids:
-            ordered_uids.append(uid)
-
-    st.session_state["global_field_order"] = ordered_uids
-
-    # Rebuild the draggable list from the preset order.
-    for key in list(st.session_state):
-        if key.startswith("global_field_sort_"):
-            st.session_state.pop(key, None)
-
-    return unmatched
-
-
-
-def is_percentage_column(column_name: str) -> bool:
-    """Recognize headers that explicitly identify the field as a percentage."""
-    name = str(column_name).strip().lower()
-    return (
-        "%" in name
-        or "percent" in name
-        or "percentage" in name
-    )
-
-
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    output = io.BytesIO()
-
-    # Excel stores 75.6% as 0.756. MOR source tables commonly store that same
-    # value as 75.6. Convert only the Excel-export copy so the workbook displays
-    # 75.6%, not 7560%, while leaving the app's extracted data unchanged.
-    export_df = df.copy()
-
-    percentage_columns = [
-        col for col in export_df.columns
-        if is_percentage_column(col)
-    ]
-
-    for col in percentage_columns:
-        numeric = pd.to_numeric(export_df[col], errors="coerce")
-        nonblank = export_df[col].notna() & export_df[col].astype(str).str.strip().ne("")
-        numeric_mask = nonblank & numeric.notna()
-
-        # Preserve blanks and any nonnumeric OCR text exactly as-is.
-        export_df.loc[numeric_mask, col] = numeric.loc[numeric_mask] / 100.0
-
-    with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="mm/dd/yyyy") as writer:
-        export_df.to_excel(writer, sheet_name="Extracted Data", index=False, na_rep="")
-
-        workbook = writer.book
-        worksheet = writer.sheets["Extracted Data"]
-
-        header = workbook.add_format(
-            {
-                "bold": True,
-                "font_color": "white",
-                "bg_color": "#1F4E78",
-                "align": "center",
-                "valign": "vcenter",
-                "text_wrap": True,
-                "border": 1,
-            }
-        )
-        date_fmt = workbook.add_format({"num_format": "mm/dd/yyyy"})
-        percent_fmt = workbook.add_format({"num_format": "0.0%"})
-
-        for col_idx, col in enumerate(export_df.columns):
-            worksheet.write(0, col_idx, col, header)
-            sample = [str(x) for x in df[col].head(80).fillna("").tolist()]
-            width = min(max([len(str(col))] + [len(x) for x in sample]) + 2, 38)
-            worksheet.set_column(col_idx, col_idx, max(width, 12))
-
-            if pd.api.types.is_datetime64_any_dtype(export_df[col]):
-                worksheet.set_column(col_idx, col_idx, max(width, 12), date_fmt)
-            elif is_percentage_column(col):
-                worksheet.set_column(col_idx, col_idx, max(width, 12), percent_fmt)
-
-        worksheet.set_row(0, 38)
-        worksheet.freeze_panes(1, 0)
-
-        if len(export_df) and len(export_df.columns):
-            worksheet.add_table(
-                0,
-                0,
-                len(export_df),
-                len(export_df.columns) - 1,
-                {
-                    "name": "MORExtractedData",
-                    "columns": [{"header": c} for c in export_df.columns],
-                    "style": "Table Style Medium 2",
-                },
-            )
-
-    return output.getvalue()
 
 
 def sample_values(series, n=8):
@@ -263,19 +65,8 @@ st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
 st.title(APP_TITLE)
 st.caption("Turn messy Monthly Operating Reports into clean, usable data.")
 
-try:
-    local_storage = LocalStorage()
-    load_presets(local_storage)
-except Exception:
-    local_storage = None
-    st.session_state.setdefault("field_presets", {})
-    st.session_state["_presets_loaded"] = True
-    st.session_state["_preset_storage_available"] = False
-
 st.caption(
-    "Upload MOR PDFs, scanned PDFs, Excel workbooks, or a ZIP of monthly reports. "
-    "Choose the worksheet or scanned-PDF page you need, select the fields, "
-    "verify the values, and export the result."
+    "Upload native MOR PDFs, Excel workbooks, or ZIP files, choose the fields you need, and export."
 )
 
 # -------------------------------------------------------------------
@@ -920,10 +711,6 @@ if "datasets" in st.session_state:
     # Multi-page / multi-sheet field selection
     # ------------------------------------------------------------------
     st.subheader("1. Choose fields from any page or worksheet")
-    st.caption(
-        "Pick a page or worksheet, choose the fields you want, then switch to another one. "
-        "Your earlier selections stay saved."
-    )
 
     dataset_labels = [
         f"{ds.name} • {len(ds.dataframe):,} rows • {len(ds.dataframe.columns)} fields • {ds.confidence}"
@@ -945,67 +732,6 @@ if "datasets" in st.session_state:
             + ", ".join(detected_labels)
         )
 
-    presets = st.session_state.get("field_presets", {})
-
-    with st.expander("Saved field presets", expanded=bool(presets)):
-        if st.session_state.get("_preset_storage_available", True):
-            st.caption(
-                "Reuse the same selected fields and drag order on later MORs. "
-                "Presets are saved in this browser."
-            )
-        else:
-            st.caption(
-                "Presets work for this session. Browser saving is temporarily unavailable, "
-                "but the rest of MORganizer is unaffected."
-            )
-
-        if presets:
-            preset_names = sorted(presets, key=str.lower)
-            preset_to_use = st.selectbox(
-                "Preset",
-                preset_names,
-                key="field_preset_to_use",
-            )
-            c1, c2 = st.columns([2, 1])
-
-            if c1.button(
-                "Apply preset",
-                type="primary",
-                use_container_width=True,
-                key="apply_field_preset",
-            ):
-                unmatched = apply_field_preset(presets[preset_to_use], datasets)
-                st.session_state["_preset_apply_result"] = (preset_to_use, unmatched)
-                st.rerun()
-
-            if c2.button(
-                "Delete",
-                use_container_width=True,
-                key="delete_field_preset",
-            ):
-                st.session_state["field_presets"].pop(preset_to_use, None)
-                persist_presets(local_storage)
-                time.sleep(0.35)
-                st.session_state["_preset_deleted"] = preset_to_use
-                st.rerun()
-        else:
-            st.info("No presets saved yet. Select your fields below, arrange them, then save that setup.")
-
-    if "_preset_apply_result" in st.session_state:
-        preset_name, unmatched = st.session_state.pop("_preset_apply_result")
-        if unmatched:
-            st.warning(
-                f'Applied "{preset_name}", but {len(unmatched)} saved field'
-                f'{"s" if len(unmatched) != 1 else ""} were not found in this batch: '
-                + ", ".join(unmatched[:8])
-                + ("…" if len(unmatched) > 8 else "")
-            )
-        else:
-            st.success(f'Applied preset "{preset_name}".')
-
-    if "_preset_deleted" in st.session_state:
-        st.success(f'Deleted preset "{st.session_state.pop("_preset_deleted")}".')
-
     active_idx = st.selectbox(
         "Page / worksheet to choose fields from",
         options=range(len(datasets)),
@@ -1016,25 +742,10 @@ if "datasets" in st.session_state:
     active_ds = datasets[active_idx]
     active_df = active_ds.dataframe.copy()
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Rows detected", f"{len(active_df):,}")
-    col2.metric("Fields detected", len(active_df.columns))
-    col3.metric("Confidence", active_ds.confidence)
-
-    for note in active_ds.notes:
-        st.caption(note)
-
-    if getattr(active_ds, "header_map", None):
-        with st.expander("OCR header interpretations", expanded=False):
-            st.caption(
-                "The cleaned heading comes from the table position and recognized MOR terminology. "
-                "Raw OCR is shown underneath so you can verify what MORganizer interpreted."
-            )
-            for cleaned, raw_ocr in active_ds.header_map.items():
-                if cleaned not in active_df.columns:
-                    continue
-                st.markdown(f"**{cleaned}**")
-                st.caption(f"Raw OCR: {raw_ocr or '(no readable OCR header text)'}")
+    st.caption(
+        f"{len(active_df):,} rows · {len(active_df.columns)} fields"
+        + (" · Review recommended" if "review" in active_ds.confidence.lower() else "")
+    )
 
     selection_key = f"selected_fields_dataset_{active_idx}"
     if selection_key not in st.session_state:
@@ -1121,11 +832,8 @@ if "datasets" in st.session_state:
 
     ordered_display = [display_for_uid[uid] for uid in ordered_uids]
 
-    st.markdown("**Selected across all pages / worksheets**")
-    st.caption(
-        "Drag the fields below into the exact order you want. "
-        "Fields from different pages or worksheets can be mixed freely."
-    )
+    st.markdown("**Selected fields**")
+    st.caption("Drag to reorder.")
 
     selection_signature = hashlib.md5(
         "||".join(sorted(selected_uid_set)).encode("utf-8")
@@ -1168,54 +876,6 @@ if "datasets" in st.session_state:
             sorted_uids.append(uid)
 
     st.session_state["global_field_order"] = sorted_uids
-
-    with st.expander("Save current field setup as a preset", expanded=False):
-        st.caption(
-            "This saves the selected fields, the page/worksheet they came from, "
-            "and the exact drag order."
-        )
-        new_preset_name = st.text_input(
-            "Preset name",
-            placeholder="Example: Fourth Creek Calibration",
-            key="new_field_preset_name",
-        )
-
-        if st.button(
-            "Save preset",
-            key="save_field_preset",
-            disabled=not bool(new_preset_name.strip()),
-        ):
-            spec_by_uid = {spec["uid"]: spec for spec in selected_specs}
-            ordered_fields = []
-            seen_key_fields = set()
-
-            for uid in sorted_uids:
-                spec = spec_by_uid.get(uid)
-                if not spec:
-                    continue
-
-                if spec["field"] in key_fields:
-                    if spec["field"] in seen_key_fields:
-                        continue
-                    seen_key_fields.add(spec["field"])
-
-                ordered_fields.append({
-                    "source": spec["source"],
-                    "field": spec["field"],
-                })
-
-            clean_name = new_preset_name.strip()
-            st.session_state.setdefault("field_presets", {})
-            st.session_state["field_presets"][clean_name] = {
-                "ordered_fields": ordered_fields
-            }
-            persist_presets(local_storage)
-            time.sleep(0.35)
-            st.session_state["_preset_saved"] = clean_name
-            st.rerun()
-
-    if "_preset_saved" in st.session_state:
-        st.success(f'Saved field preset "{st.session_state.pop("_preset_saved")}".')
 
     # ------------------------------------------------------------------
     # Combine fields from multiple pages/sheets into one daily table
@@ -1301,61 +961,13 @@ if "datasets" in st.session_state:
     elif join_key == "Day" and "Day" in preview.columns:
         preview = preview.sort_values("Day", kind="stable").reset_index(drop=True)
 
-    # ------------------------------------------------------------------
-    # Rename output columns
-    # ------------------------------------------------------------------
-    st.subheader("2. Rename output columns")
-    st.caption(
-        "Optional: change the names that will appear in the exported file. "
-        "The extracted values are not changed."
-    )
-
-    original_columns = list(preview.columns)
-    requested_names = []
-
-    with st.expander("Rename selected fields", expanded=False):
-        for idx, col in enumerate(original_columns):
-            if col in {"Date", "Day"}:
-                requested_names.append(col)
-                st.text_input(
-                    f"Original: {col}",
-                    value=col,
-                    disabled=True,
-                    key=f"rename_output_{idx}_{col}",
-                )
-                continue
-
-            requested_names.append(
-                st.text_input(
-                    f"Original: {col}",
-                    value=col,
-                    key=f"rename_output_{idx}_{col}",
-                )
-            )
-
-    unique_names = make_unique_names(requested_names)
-    renamed_from = {
-        new: old for old, new in zip(original_columns, unique_names)
-    }
-
-    duplicate_adjustments = [
-        (requested, unique)
-        for requested, unique in zip(requested_names, unique_names)
-        if str(requested).strip() and str(requested).strip() != unique
-    ]
-    if duplicate_adjustments:
-        st.warning(
-            "Two or more output fields were given the same name. "
-            "MORganizer added numbers such as “(2)” so every exported column stays unique."
-        )
-
-    preview = preview.copy()
-    preview.columns = unique_names
+    # Keep extracted MOR headers unchanged in the export.
+    renamed_from = {col: col for col in preview.columns}
 
     # ------------------------------------------------------------------
     # QA/QC review
     # ------------------------------------------------------------------
-    st.subheader("3. Data quality review")
+    st.subheader("2. Data quality review")
     st.caption(
         "MORganizer only flags values that deserve a second look. "
         "It never changes or corrects the extracted data automatically."
@@ -1388,7 +1000,7 @@ if "datasets" in st.session_state:
     # ------------------------------------------------------------------
     # Verification
     # ------------------------------------------------------------------
-    st.subheader("4. Verify sample values")
+    st.subheader("3. Verify sample values")
 
     for col in preview.columns:
         if col in {"Date", "Day"}:
@@ -1406,22 +1018,16 @@ if "datasets" in st.session_state:
 
         st.code(shown, language=None)
 
-    if len(participating) > 1:
-        if join_key:
-            st.caption(
-                f"Fields from {len(participating)} detected pages/worksheets were combined using "
-                f"{join_key} so values stay on the correct daily row."
-            )
-        else:
-            st.warning(
-                "These selected tables do not share a Date or Day field, so MORganizer aligned "
-                "them by row position. Verify the preview carefully before export."
-            )
+    if len(participating) > 1 and not join_key:
+        st.warning(
+            "These selected tables do not share a Date or Day field, so MORganizer aligned "
+            "them by row position. Verify the preview carefully before export."
+        )
 
     # ------------------------------------------------------------------
     # Preview + export
     # ------------------------------------------------------------------
-    st.subheader("5. Preview")
+    st.subheader("4. Preview")
     display_preview = preview.astype(object).where(pd.notna(preview), "")
     st.dataframe(display_preview, use_container_width=True, height=500)
 
