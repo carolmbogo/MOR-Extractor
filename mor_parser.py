@@ -329,36 +329,36 @@ def _column_bounds(anchors, idx):
     right = 1e9 if idx == len(anchors)-1 else (anchor + anchors[idx+1]) / 2.0
     return left, right
 
-def _assign_header_words_to_columns(row, anchors):
-    """Assign each header word to the physical data column it sits over."""
+def _map_child_row(row, anchors):
+    """
+    Assign each header WORD to a physical data column first, then join words
+    within that column. This prevents adjacent children such as
+    'Inf. PPM | Eff. PPM' and 'Alkalinity PPM | Vol. Acids PPM' from merging.
+    """
     words = _row_words(row)
     buckets = {j: [] for j in range(len(anchors))}
-    if not words:
-        return {}
-
     for w in words:
-        j = min(range(len(anchors)), key=lambda k: abs(w["xc"] - anchors[k]))
-        left, right = _column_bounds(anchors, j)
-        tol = max(4.0, 0.08 * _median_anchor_gap(anchors))
-        if left - tol <= w["xc"] <= right + tol:
-            buckets[j].append(w)
-
-    mapped = {}
-    for j, parts in buckets.items():
-        if parts:
-            parts = sorted(parts, key=lambda w: w["x0"])
-            mapped[j] = _norm_header(" ".join(w["text"] for w in parts))
-    return mapped
-
-
-def _map_child_row(row, anchors):
-    return _assign_header_words_to_columns(row, anchors)
+        # Word ownership is determined by its center relative to column bounds.
+        for j in range(len(anchors)):
+            left, right = _column_bounds(anchors, j)
+            if left <= w["xc"] < right:
+                buckets[j].append(w["text"])
+                break
+    return {
+        j: _norm_header(" ".join(parts))
+        for j, parts in buckets.items()
+        if parts
+    }
 
 
 def _map_parent_row(row, anchors):
     """
-    Divide broad parent bands at midpoints between neighboring heading centers.
-    This stops Grease from swallowing Influent NH3-N or Secondary System MLSS.
+    Assign broad parent headings using Voronoi-style boundaries between parent
+    heading centers. A parent owns only the child columns geometrically closest
+    to that heading before the next parent begins.
+
+    This is safer for dense MOR pages where a narrow parent such as Grease sits
+    between standalone Influent NH3-N and Secondary System MLSS.
     """
     phrases = _group_row_phrases(row)
     if not phrases:
@@ -366,65 +366,54 @@ def _map_parent_row(row, anchors):
 
     phrases = sorted(phrases, key=lambda p: p["xc"])
     gap = _median_anchor_gap(anchors)
-    centers = [p["xc"] for p in phrases]
     mapped = {}
 
-    for i, p in enumerate(phrases):
-        left = (
-            p["xc"] - max(1.20 * gap, 30.0)
-            if i == 0 else (centers[i-1] + centers[i]) / 2.0
-        )
-        right = (
-            p["xc"] + max(1.75 * gap, 48.0)
-            if i == len(phrases)-1 else (centers[i] + centers[i+1]) / 2.0
-        )
+    # Boundaries halfway between neighboring parent heading centers.
+    boundaries = [-1e9]
+    for left_p, right_p in zip(phrases, phrases[1:]):
+        boundaries.append((left_p["xc"] + right_p["xc"]) / 2.0)
+    boundaries.append(1e9)
+
+    for i, phrase in enumerate(phrases):
+        left = boundaries[i]
+        right = boundaries[i + 1]
+
+        # Do not let the first/last heading claim arbitrarily distant columns.
+        if i == 0:
+            left = phrase["xc"] - max(1.35 * gap, 34.0)
+        if i == len(phrases) - 1:
+            right = phrase["xc"] + max(1.75 * gap, 48.0)
+
         for j, anchor in enumerate(anchors):
             if left <= anchor < right:
-                mapped[j] = p["text"]
+                mapped[j] = phrase["text"]
+
     return mapped
 
 
 def _map_subparent_row(row, anchors):
-    # NH3-N, MLSS, Return, 30 Min, Alkalinity, Vol. Acids, Detention Time, etc.
-    # are local column labels, not bands that may spread sideways.
-    return _assign_header_words_to_columns(row, anchors)
+    phrases = _group_row_phrases(row)
+    if not phrases:
+        return {}
 
+    gap = _median_anchor_gap(anchors)
+    mapped = {}
+    claimed = set()
 
-def _is_stronger_parent(text):
-    low = _norm_header(text).lower()
-    return (
-        "anaerobic digester" in low
-        or "final effluent parameters" in low
-        or bool(re.search(r"\bdigester\s+no\.?\s*\d+\b", low))
-    )
+    for phrase in phrases:
+        ranked = sorted(
+            range(len(anchors)),
+            key=lambda j: abs(anchors[j] - phrase["xc"])
+        )
+        for j in ranked:
+            if j in claimed:
+                continue
+            if abs(anchors[j] - phrase["xc"]) <= max(0.80 * gap, 20.0):
+                mapped[j] = phrase["text"]
+                claimed.add(j)
+            break
+    return mapped
 
-
-def _repair_header_path(path):
-    """
-    A wrapped standalone parent starts a new hierarchy.
-
-    Thus:
-      Digester No. 6 / Anaerobic Digester / Detention Time / Days
-    becomes:
-      Anaerobic Digester Detention Time Days
-    """
-    cleaned = _clean_header_path(path)
-    if not cleaned:
-        return cleaned
-
-    reset_at = None
-    for i in range(1, len(cleaned)):
-        if _is_stronger_parent(cleaned[i]):
-            reset_at = i
-    if reset_at is not None:
-        cleaned = cleaned[reset_at:]
-
-    joined = " ".join(cleaned).lower()
-    if "anaerobic digester" in joined:
-        idx = next(i for i,p in enumerate(cleaned)
-                   if "anaerobic digester" in p.lower())
-        cleaned = cleaned[idx:]
-    return cleaned
 
 def _phrase_bands_for_row(row, anchors, role="parent"):
     return _map_child_row(row, anchors) if role == "child" else _map_parent_row(row, anchors)
@@ -478,8 +467,17 @@ def build_hierarchical_pdf_headers(anchors, header_rows):
 
         parent = _norm_header(broad_parent_map.get(j, ""))
         subs = [_norm_header(m.get(j, "")) for m in sub_maps]
-        pieces = [parent] + subs + ([child] if child else [])
-        path = _repair_header_path(
+
+        # A fully descriptive leaf is its own field, not a child of the nearest
+        # process band. This is important for right-edge standalone fields such
+        # as "Anaerobic Digester Detention Time, Days" beside Digester No. 6.
+        child_low = child.lower()
+        standalone_leaf = (
+            "anaerobic digester detention" in child_low
+            or "detention time" in child_low
+        )
+        pieces = ([child] if standalone_leaf else [parent] + subs + ([child] if child else []))
+        path = _clean_header_path(
             [p for p in pieces if p and not _is_metadata_text(p)]
         )
 

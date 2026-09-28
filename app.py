@@ -787,8 +787,8 @@ if "datasets" in st.session_state:
 
     if not datasets:
         st.error(
-            "No usable daily MOR table was found. For a scanned PDF, try selecting the page "
-            "that contains the daily operating table and make sure the day/date column is visible."
+            "No usable daily MOR table was found on the selected page(s). "
+            "Open Processing notes above for the specific file error."
         )
         st.stop()
 
