@@ -1519,6 +1519,20 @@ KUB_PAGE2_CANONICAL_HEADERS = [
 ]
 
 
+
+KUB_PAGE3_CANONICAL_HEADERS = [
+    "Date",
+    "Cadmium Influent mg/L", "Cadmium Effluent mg/L",
+    "Chromium Influent mg/L", "Chromium Effluent mg/L",
+    "Copper Influent mg/L", "Copper Effluent mg/L",
+    "Nickel Influent mg/L", "Nickel Effluent mg/L",
+    "Zinc Influent mg/L", "Zinc Effluent mg/L",
+    "Silver Influent mg/L", "Silver Effluent mg/L",
+    "Lead Influent mg/L", "Lead Effluent mg/L",
+    "Filter Press % Solids", "Filter Press Lbs of Solids",
+    "Solids Disposal Farm Loads", "Solids Disposal Landfill Loads",
+]
+
 def _apply_recognized_kub_page1_headers(datasets):
     """Lock verified native-text KUB page 1 and page 2 header hierarchies.
 
@@ -1535,6 +1549,21 @@ def _apply_recognized_kub_page1_headers(datasets):
         headers = verified.get(ds.name)
         if headers and len(ds.dataframe.columns) == len(headers):
             ds.dataframe.columns = headers
+            ds.confidence = "High"
+
+        # Page 3 has four right-hand fields, but two of them can be completely
+        # blank for an entire month. A value-only anchor detector therefore
+        # sees only 17 columns and incorrectly fuses the printed header bands.
+        # On the verified KUB form, preserve all four physical fields explicitly.
+        if ds.name == "PDF Page 3" and len(ds.dataframe.columns) == 17:
+            old_cols = list(ds.dataframe.columns)
+            fixed = ds.dataframe.iloc[:, :15].copy()
+            fixed.columns = KUB_PAGE3_CANONICAL_HEADERS[:15]
+            fixed[KUB_PAGE3_CANONICAL_HEADERS[15]] = ds.dataframe.iloc[:, 15]
+            fixed[KUB_PAGE3_CANONICAL_HEADERS[16]] = None
+            fixed[KUB_PAGE3_CANONICAL_HEADERS[17]] = None
+            fixed[KUB_PAGE3_CANONICAL_HEADERS[18]] = ds.dataframe.iloc[:, 16]
+            ds.dataframe = fixed[KUB_PAGE3_CANONICAL_HEADERS]
             ds.confidence = "High"
     return datasets
 
