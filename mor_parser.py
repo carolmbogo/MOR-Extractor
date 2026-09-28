@@ -348,49 +348,27 @@ def _map_child_row(row, anchors):
             mapped[j] = min(candidates, key=lambda x: x[0])[1]["text"]
     return mapped
 
-def _map_parent_row(row, anchors):
-    """
-    Map broad MOR section headings after child columns are established.
-
-    Ownership follows the visual starts of consecutive parent headings. This
-    better matches underlined MOR bands than center-to-center splitting and
-    prevents a later heading from stealing the last child of the prior group.
-    """
-    phrases = _group_row_phrases(row)
-    if not phrases:
-        return {}
-
-    gap = _median_anchor_gap(anchors)
+def _map_header_words_to_columns(row, anchors):
     mapped = {}
+    words = sorted(row.get("words", []), key=lambda w: w["x0"])
+    for j, anchor in enumerate(anchors):
+        left, right = _column_bounds(anchors, j)
+        pieces=[]
+        for w in words:
+            xc=word_center(w)
+            if left <= xc < right:
+                text=clean_text(w.get("text"))
+                if text: pieces.append(text)
+        if pieces: mapped[j]=" ".join(pieces)
+    return mapped
 
-    if len(phrases) == 1:
-        p = phrases[0]
-        # A single broad heading may span several children around its text.
-        left = p["x0"] - max(gap, 18.0)
-        right = p["x1"] + max(2.0 * gap, 36.0)
-        for j, anchor in enumerate(anchors):
-            if left <= anchor <= right:
-                mapped[j] = p["text"]
-        return mapped
-
-    for i, p in enumerate(phrases):
-        # Do not extend the first parent all the way to the page edge; this
-        # keeps standalone Date outside the first process family.
-        left = (
-            p["x0"] - min(max(0.65 * gap, 12.0), 24.0)
-            if i == 0 else p["x0"]
-        )
-
-        if i < len(phrases) - 1:
-            # The next heading's visual start is the ownership boundary.
-            right = phrases[i+1]["x0"]
-        else:
-            right = p["x1"] + max(3.0 * gap, 54.0)
-
-        for j, anchor in enumerate(anchors):
-            if left <= anchor < right:
-                mapped[j] = p["text"]
-
+def _map_parent_row(row, anchors):
+    phrases=_group_row_phrases(row)
+    if not phrases: return {}
+    mapped={}
+    for j,anchor in enumerate(anchors):
+        p=min(phrases,key=lambda q: abs(anchor-q["xc"]))
+        mapped[j]=p["text"]
     return mapped
 
 def _map_subparent_row(row, anchors):
@@ -435,53 +413,36 @@ def _clean_header_path(parts):
     return cleaned
 
 def build_hierarchical_pdf_headers(anchors, header_rows):
-    """
-    Column-first native PDF header reconstruction.
-
-    The lowest header row is assigned to physical data columns first.
-    The top row supplies broad process/parameter parents.
-    Any rows between them are local sub-headings attached only to the nearest
-    established column. This prevents NH3-N, MLSS, Return, or 30 Min from
-    leaking sideways into neighboring columns.
-    """
-    if not anchors:
-        return []
-
-    usable_rows = [r for r in header_rows if _group_row_phrases(r)]
-    if not usable_rows:
-        return make_unique([f"Review Column {i+1}" for i in range(len(anchors))])
-
-    child_map = _map_child_row(usable_rows[-1], anchors)
-
-    broad_parent_map = {}
-    sub_maps = []
-    if len(usable_rows) >= 2:
-        broad_parent_map = _map_parent_row(usable_rows[0], anchors)
-    if len(usable_rows) > 2:
-        sub_maps = [_map_subparent_row(r, anchors) for r in usable_rows[1:-1]]
-
-    names = []
-    for j, _ in enumerate(anchors):
-        child = _norm_header(child_map.get(j, ""))
-
-        if child.lower() == "date":
-            names.append("Date")
-            continue
-
-        parent = _norm_header(broad_parent_map.get(j, ""))
-        subs = [_norm_header(m.get(j, "")) for m in sub_maps]
-        pieces = [parent] + subs + ([child] if child else [])
-        path = _clean_header_path(
-            [p for p in pieces if p and not _is_metadata_text(p)]
-        )
-
-        if not child:
-            names.append(f"Review Column {j+1}")
-        elif path:
-            names.append(" ".join(path))
-        else:
-            names.append(f"Review Column {j+1}")
-
+    """Column-first multi-level MOR header reconstruction."""
+    if not anchors: return []
+    usable=[r for r in header_rows if r.get("words")]
+    if not usable: return make_unique([f"Review Column {i+1}" for i in range(len(anchors))])
+    broad=_map_parent_row(usable[0], anchors) if len(usable)>1 else {}
+    # Never re-use the broad-parent row as local child text.
+    local=[_map_header_words_to_columns(r,anchors) for r in usable[1:]] if len(usable)>1 else [_map_header_words_to_columns(usable[0],anchors)]
+    names=[]
+    for j in range(len(anchors)):
+        stack=[]
+        parent=_norm_header(broad.get(j,''))
+        if parent and not _is_metadata_text(parent): stack.append(parent)
+        for m in local:
+            text=_norm_header(m.get(j,''))
+            if not text or _is_metadata_text(text): continue
+            key=lambda x: re.sub(r'[^a-z0-9]+','',x.lower())
+            if stack and key(text)==key(stack[-1]): continue
+            stack.append(text)
+        if any(_norm_header(x).lower()=='date' for x in stack):
+            names.append('Date'); continue
+        path=_clean_header_path(stack)
+        if not path:
+            names.append(f'Review Column {j+1}'); continue
+        label=' '.join(path)
+        label=re.sub(r'\bDigester\s+No\.?\s*(\d+)\b',r'Digester No. \1',label,flags=re.I)
+        label=re.sub(r'\bNH3[\s-]*N\b','NH3-N',label,flags=re.I)
+        label=re.sub(r'\bVol\.?\s+Acids?\b','Vol. Acids',label,flags=re.I)
+        label=re.sub(r'\bSet\.?\s+Sol\.?\b','Set. Sol.',label,flags=re.I)
+        label=re.sub(r'\s+',' ',label).strip()
+        names.append(label)
     return make_unique(names)
 
 
