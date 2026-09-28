@@ -602,8 +602,9 @@ if uploads:
 
         st.subheader("Choose PDF page(s)")
         st.info(
-            "MORganizer treats physical PDF pages as separate pages. "
-            "All pages are selected by default so later pages cannot be silently skipped."
+            "MORganizer supports text-based PDFs, Excel files, and ZIP files containing "
+            "those formats. Physical PDF pages stay separate and all pages are selected "
+            "by default. Scanned/image-only PDFs are skipped because OCR is disabled."
         )
 
         for idx, (name, data) in enumerate(pdf_items):
@@ -612,9 +613,18 @@ if uploads:
 
             info = pdf_info_by_file[name]
             page_count = int(info.get("page_count", 0))
+
+            if info.get("is_scanned"):
+                st.warning(
+                    f"{name} — scanned/image-only PDF detected and skipped. "
+                    "OCR extraction is disabled for reliability."
+                )
+                selected_pdf_pages_by_file[name] = []
+                continue
+
             options = list(range(1, page_count + 1))
             default_pages = options.copy()
-            pdf_kind = "scanned/OCR" if info.get("is_scanned") else "text PDF"
+            pdf_kind = "text PDF"
 
             selected_pages = st.multiselect(
                 f"{name} — {page_count} physical page(s) detected • {pdf_kind}",
@@ -628,16 +638,10 @@ if uploads:
             )
             selected_pdf_pages_by_file[name] = selected_pages
 
-        if scanned_pdf_count:
-            st.caption(
-                "Scanned pages use OCR while preserving page boundaries. "
-                "Verify OCR sample values before export."
-            )
-        else:
-            st.caption(
-                "Text PDFs are parsed page-by-page; columns detected on one physical page "
-                "will not be assigned to another page."
-            )
+        st.caption(
+            "Text PDFs are parsed page-by-page. Parent and child table headers are "
+            "reconstructed from the native PDF text geometry."
+        )
 
     if st.button("Detect MOR Fields", type="primary"):
         datasets = []
