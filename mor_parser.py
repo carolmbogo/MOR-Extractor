@@ -239,79 +239,113 @@ def make_unique(names):
     return out
 
 
-def extract_generic_pdf(data: bytes, source_name: str) -> list[DetectedDataset]:
+def extract_generic_page(page, page_no: int, source_name: str) -> DetectedDataset | None:
+    """
+    Extract one physical text-PDF page as one independent dataset.
+
+    Physical page boundaries are authoritative. Columns from Page 2 can never
+    be merged with Page 3 merely because their layouts look similar.
+    """
+    date_rows, all_rows = extract_date_rows(page)
+    if len(date_rows) < 2:
+        return None
+
+    value_x = []
+    date_anchor = None
+    for row in date_rows:
+        for w in row["words"]:
+            text = clean_text(w["text"])
+            x = word_center(w)
+            if DATE_RE.match(text):
+                if date_anchor is None:
+                    date_anchor = x
+            else:
+                value_x.append(x)
+
+    anchors = cluster_positions(value_x, tolerance=10.5)
+    if not anchors:
+        return None
+
+    first_top = min(r["top"] for r in date_rows)
+    # More header rows are retained because MOR pages often have section
+    # headings + subheadings + units stacked above the daily values.
+    header_rows = find_header_rows(all_rows, first_top, max_rows=7)
+    full_anchors = ([date_anchor] if date_anchor is not None else []) + anchors
+    full_anchors = sorted(full_anchors)
+
+    labels = []
+    for idx, anchor in enumerate(full_anchors):
+        if date_anchor is not None and abs(anchor - date_anchor) < 2:
+            labels.append("Date")
+            continue
+        left = -1e9 if idx == 0 else (full_anchors[idx - 1] + anchor) / 2
+        right = 1e9 if idx == len(full_anchors) - 1 else (anchor + full_anchors[idx + 1]) / 2
+        labels.append(generic_header_for_anchor(anchor, header_rows, (left, right)))
+    labels = make_unique(labels)
+
+    records = []
+    for row in date_rows:
+        record = {label: None for label in labels}
+        for w in row["words"]:
+            text = clean_text(w["text"])
+            x = word_center(w)
+            if DATE_RE.match(text) and "Date" in record:
+                record["Date"] = pd.to_datetime(text, errors="coerce")
+                continue
+            idx = min(range(len(full_anchors)), key=lambda i: abs(x - full_anchors[i]))
+            if abs(x - full_anchors[idx]) <= 16.0:
+                label = labels[idx]
+                if label == "Date":
+                    continue
+                value = parse_value(text)
+                if record[label] is None:
+                    record[label] = value
+                else:
+                    record[label] = f"{record[label]} {text}"
+
+        if record.get("Date") is not None and not pd.isna(record["Date"]):
+            records.append(record)
+
+    df = pd.DataFrame(records, columns=labels)
+    if len(df) < 2 or len(df.columns) < 2:
+        return None
+
+    return DetectedDataset(
+        name=f"PDF Page {page_no}",
+        source_name=source_name,
+        dataframe=df,
+        confidence="Review required",
+        notes=[
+            f"Extracted strictly from physical PDF page {page_no}.",
+            "Columns were inferred only from this page's repeated x-positions and header text.",
+            "Physical PDF pages are kept separate before any cross-file monthly combining.",
+            "Confirm sample values before exporting.",
+        ],
+    )
+
+
+def extract_generic_pdf(
+    data: bytes,
+    source_name: str,
+    selected_pages=None,
+) -> list[DetectedDataset]:
     datasets = []
     with pdfplumber.open(io.BytesIO(data)) as pdf:
-        for page_no, page in enumerate(pdf.pages, start=1):
-            date_rows, all_rows = extract_date_rows(page)
-            if len(date_rows) < 2:
-                continue
+        page_count = len(pdf.pages)
 
-            value_x = []
-            date_anchor = None
-            for row in date_rows:
-                for w in row["words"]:
-                    text = clean_text(w["text"])
-                    x = word_center(w)
-                    if DATE_RE.match(text):
-                        if date_anchor is None:
-                            date_anchor = x
-                    else:
-                        value_x.append(x)
+        if selected_pages is None:
+            selected = list(range(1, page_count + 1))
+        else:
+            selected = sorted({
+                int(p) for p in selected_pages
+                if str(p).isdigit() and 1 <= int(p) <= page_count
+            })
 
-            anchors = cluster_positions(value_x, tolerance=10.5)
-            if not anchors:
-                continue
+        for page_no in selected:
+            ds = extract_generic_page(pdf.pages[page_no - 1], page_no, source_name)
+            if ds is not None:
+                datasets.append(ds)
 
-            first_top = min(r["top"] for r in date_rows)
-            header_rows = find_header_rows(all_rows, first_top, max_rows=4)
-            full_anchors = ([date_anchor] if date_anchor is not None else []) + anchors
-            full_anchors = sorted(full_anchors)
-
-            labels = []
-            for idx, anchor in enumerate(full_anchors):
-                if date_anchor is not None and abs(anchor - date_anchor) < 2:
-                    labels.append("Date")
-                    continue
-                left = -1e9 if idx == 0 else (full_anchors[idx - 1] + anchor) / 2
-                right = 1e9 if idx == len(full_anchors) - 1 else (anchor + full_anchors[idx + 1]) / 2
-                labels.append(generic_header_for_anchor(anchor, header_rows, (left, right)))
-            labels = make_unique(labels)
-
-            records = []
-            for row in date_rows:
-                record = {label: None for label in labels}
-                for w in row["words"]:
-                    text = clean_text(w["text"])
-                    x = word_center(w)
-                    if DATE_RE.match(text) and "Date" in record:
-                        record["Date"] = pd.to_datetime(text, errors="coerce")
-                        continue
-                    idx = min(range(len(full_anchors)), key=lambda i: abs(x - full_anchors[i]))
-                    if abs(x - full_anchors[idx]) <= 16.0:
-                        label = labels[idx]
-                        if label == "Date":
-                            continue
-                        value = parse_value(text)
-                        if record[label] is None:
-                            record[label] = value
-                        else:
-                            record[label] = f"{record[label]} {text}"
-                if record.get("Date") is not None and not pd.isna(record["Date"]):
-                    records.append(record)
-
-            df = pd.DataFrame(records, columns=labels)
-            if len(df) >= 2 and len(df.columns) >= 2:
-                datasets.append(DetectedDataset(
-                    name=f"Generic daily table - Page {page_no}",
-                    source_name=source_name, dataframe=df,
-                    confidence="Review required",
-                    notes=[
-                        "This file did not match a saved MOR template.",
-                        "Columns were inferred from repeated PDF x-positions and nearby header text.",
-                        "Confirm sample values before exporting.",
-                    ],
-                ))
     return datasets
 
 
@@ -351,7 +385,7 @@ def get_pdf_page_info(data: bytes) -> dict:
     return {
         "page_count": page_count,
         "is_scanned": text_chars < 80,
-        "suggested_pages": [1] if page_count else [],
+        "suggested_pages": list(range(1, page_count + 1)),
     }
 
 
@@ -1115,19 +1149,29 @@ def extract_scanned_pdf(data: bytes, source_name: str, selected_pages=None):
 
 
 def extract_pdf(data: bytes, source_name: str, selected_pages=None) -> list[DetectedDataset]:
+    """
+    Parse PDFs page-by-page. The physical PDF page count and selected physical
+    page numbers are authoritative for both text PDFs and scanned PDFs.
+    """
     info = get_pdf_page_info(data)
+
+    # If the caller did not choose pages, inspect every physical page.
+    pages = selected_pages
+    if pages is None:
+        pages = list(range(1, int(info.get("page_count", 0)) + 1))
 
     if info["is_scanned"]:
         return extract_scanned_pdf(
             data,
             source_name,
-            selected_pages=selected_pages or info["suggested_pages"],
+            selected_pages=pages,
         )
 
-    with pdfplumber.open(io.BytesIO(data)) as pdf:
-        known = is_kub_fourth_creek(pdf)
-
-    return extract_kub_pdf(data, source_name) if known else extract_generic_pdf(data, source_name)
+    return extract_generic_pdf(
+        data,
+        source_name,
+        selected_pages=pages,
+    )
 
 
 # ----------------------------
@@ -1933,9 +1977,19 @@ def detect_file(
 
 
 def combine_same_named_datasets(datasets: list[DetectedDataset]):
+    """
+    Combine the same logical page/worksheet across uploaded files.
+
+    Monthly MORs do NOT need to be consecutive and they do NOT need to have an
+    identical column tuple. A small header/layout difference in January must
+    never cause January to become a separate hidden dataset while April/June
+    are combined together.
+    """
     groups = {}
     for ds in datasets:
-        key = (ds.name, tuple(ds.dataframe.columns), ds.confidence)
+        # Page/worksheet identity is the stable grouping key. Confidence and an
+        # exact column tuple are deliberately excluded.
+        key = ds.name
         groups.setdefault(key, []).append(ds)
 
     out = []
@@ -1944,16 +1998,41 @@ def combine_same_named_datasets(datasets: list[DetectedDataset]):
             out.append(members[0])
             continue
 
-        combined = pd.concat([m.dataframe for m in members], ignore_index=True)
+        # Union-concat keeps every row from every uploaded month. Columns that
+        # genuinely do not exist in one month remain blank for that month.
+        combined = pd.concat(
+            [m.dataframe for m in members],
+            ignore_index=True,
+            sort=False,
+        )
+
         if "Date" in combined.columns:
+            combined["Date"] = pd.to_datetime(combined["Date"], errors="coerce")
             combined = combined.sort_values("Date", kind="stable").reset_index(drop=True)
+
+        # Merge OCR header maps when present.
+        merged_header_map = {}
+        for m in members:
+            if m.header_map:
+                merged_header_map.update(m.header_map)
+
+        # Keep useful notes without repeating the same note for every month.
+        notes = []
+        for m in members:
+            for note in m.notes:
+                if note not in notes:
+                    notes.append(note)
+        notes.append(
+            f"Combined {len(members)} matching monthly file(s), including nonconsecutive months."
+        )
 
         out.append(DetectedDataset(
             name=members[0].name,
             source_name=f"{len(members)} files",
             dataframe=combined,
             confidence=members[0].confidence,
-            notes=members[0].notes + [f"Combined {len(members)} matching files."],
-            header_map=members[0].header_map,
+            notes=notes,
+            header_map=merged_header_map or None,
         ))
+
     return out

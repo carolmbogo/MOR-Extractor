@@ -576,7 +576,7 @@ if uploads:
         )
 
     # ---------------------------------------------------------------
-    # Scanned PDF page selection
+    # PDF physical page selection
     # ---------------------------------------------------------------
     pdf_items = [
         (name, data)
@@ -595,44 +595,48 @@ if uploads:
             except Exception as exc:
                 prep_errors.append(f"{name}: could not inspect PDF pages ({exc})")
 
-        scanned_items = [
-            (name, data, pdf_info_by_file[name])
-            for name, data in pdf_items
+        scanned_pdf_count = sum(
+            1 for name, _ in pdf_items
             if name in pdf_info_by_file and pdf_info_by_file[name].get("is_scanned")
-        ]
+        )
 
-        scanned_pdf_count = len(scanned_items)
+        st.subheader("Choose PDF page(s)")
+        st.info(
+            "MORganizer treats physical PDF pages as separate pages. "
+            "All pages are selected by default so later pages cannot be silently skipped."
+        )
 
-        if scanned_items:
-            st.subheader("Choose scanned PDF page(s)")
-            st.info(
-                "Scanned PDF detected. MORganizer 3000 will OCR only the pages you select, "
-                "so supporting lab reports and attachments do not have to be processed."
+        for idx, (name, data) in enumerate(pdf_items):
+            if name not in pdf_info_by_file:
+                continue
+
+            info = pdf_info_by_file[name]
+            page_count = int(info.get("page_count", 0))
+            options = list(range(1, page_count + 1))
+            default_pages = options.copy()
+            pdf_kind = "scanned/OCR" if info.get("is_scanned") else "text PDF"
+
+            selected_pages = st.multiselect(
+                f"{name} — {page_count} physical page(s) detected • {pdf_kind}",
+                options=options,
+                default=default_pages,
+                key=f"pdf_pages_{idx}_{name}",
+                help=(
+                    "Each number is an actual page in the PDF file. "
+                    "Deselect only pages you intentionally do not want parsed."
+                ),
             )
+            selected_pdf_pages_by_file[name] = selected_pages
 
-            for idx, (name, data, info) in enumerate(scanned_items):
-                page_count = int(info.get("page_count", 0))
-                options = list(range(1, page_count + 1))
-                default_pages = [
-                    p for p in info.get("suggested_pages", [1])
-                    if p in options
-                ] or ([1] if options else [])
-
-                selected_pages = st.multiselect(
-                    f"{name} — {page_count} page(s)",
-                    options=options,
-                    default=default_pages,
-                    key=f"pdf_pages_{idx}_{name}",
-                    help=(
-                        "Select only the page(s) containing the monthly operating table. "
-                        "Page 1 is suggested by default because the primary MOR is commonly first."
-                    ),
-                )
-                selected_pdf_pages_by_file[name] = selected_pages
-
+        if scanned_pdf_count:
             st.caption(
-                "OCR preserves word positions so values can be assigned back to table columns. "
-                "Because scans can be faint or skewed, always verify the sample values before export."
+                "Scanned pages use OCR while preserving page boundaries. "
+                "Verify OCR sample values before export."
+            )
+        else:
+            st.caption(
+                "Text PDFs are parsed page-by-page; columns detected on one physical page "
+                "will not be assigned to another page."
             )
 
     if st.button("Detect MOR Fields", type="primary"):
@@ -725,16 +729,54 @@ def qa_flags(df, original_names_by_output=None):
 
         if len(valid) >= 2:
             normalized = pd.DatetimeIndex(valid.dt.normalize().unique()).sort_values()
-            expected = pd.date_range(normalized.min(), normalized.max(), freq="D")
-            missing = expected.difference(normalized)
-            if len(missing):
-                labels = [d.strftime("%m/%d/%Y") for d in missing[:12]]
+
+            # Report whole missing months explicitly. This makes arbitrary,
+            # nonconsecutive uploads understandable (e.g. Jan + Apr + Jun).
+            present_months = pd.PeriodIndex(normalized, freq="M").unique().sort_values()
+            if len(present_months) >= 2:
+                expected_months = pd.period_range(
+                    present_months.min(),
+                    present_months.max(),
+                    freq="M",
+                )
+                missing_months = expected_months.difference(present_months)
+                if len(missing_months):
+                    month_labels = [p.strftime("%B %Y") for p in missing_months]
+                    flags.append({
+                        "severity": "info",
+                        "field": "Date",
+                        "issue": "Missing month(s) within uploaded date range: "
+                                 + ", ".join(month_labels),
+                        "count": len(missing_months),
+                    })
+
+            # Daily gaps are still useful inside months that ARE present, but
+            # do not flood QA with every day belonging to a wholly absent month.
+            missing_daily = []
+            for period in present_months:
+                month_dates = normalized[
+                    (normalized.year == period.year) &
+                    (normalized.month == period.month)
+                ]
+                if len(month_dates) == 0:
+                    continue
+                expected_in_present_month = pd.date_range(
+                    period.start_time.normalize(),
+                    period.end_time.normalize(),
+                    freq="D",
+                )
+                missing_daily.extend(
+                    expected_in_present_month.difference(month_dates).tolist()
+                )
+
+            if missing_daily:
+                labels = [pd.Timestamp(d).strftime("%m/%d/%Y") for d in missing_daily[:12]]
                 flags.append({
                     "severity": "info",
                     "field": "Date",
-                    "issue": f"Missing daily date(s): {', '.join(labels)}"
-                             + ("…" if len(missing) > 12 else ""),
-                    "count": len(missing),
+                    "issue": f"Missing daily date(s) inside uploaded month(s): {', '.join(labels)}"
+                             + ("…" if len(missing_daily) > 12 else ""),
+                    "count": len(missing_daily),
                 })
 
         invalid_date_count = int(df["Date"].notna().sum() - dates.notna().sum())
@@ -865,6 +907,21 @@ if "datasets" in st.session_state:
         f"{ds.name} • {len(ds.dataframe):,} rows • {len(ds.dataframe.columns)} fields • {ds.confidence}"
         for ds in datasets
     ]
+
+    # Show which calendar months actually survived parsing/combining.
+    all_detected_dates = []
+    for ds in datasets:
+        if "Date" in ds.dataframe.columns:
+            parsed_dates = pd.to_datetime(ds.dataframe["Date"], errors="coerce").dropna()
+            all_detected_dates.extend(parsed_dates.tolist())
+
+    if all_detected_dates:
+        detected_periods = pd.PeriodIndex(all_detected_dates, freq="M").unique().sort_values()
+        detected_labels = [p.strftime("%B %Y") for p in detected_periods]
+        st.caption(
+            f"Calendar months loaded ({len(detected_labels)}): "
+            + ", ".join(detected_labels)
+        )
 
     presets = st.session_state.get("field_presets", {})
 
