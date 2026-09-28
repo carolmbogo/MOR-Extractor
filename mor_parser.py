@@ -241,246 +241,148 @@ def make_unique(names):
 
 
 # -------------------------------------------------------------------
-# Native text-PDF hierarchical header reconstruction
+# Native text-PDF hierarchical header reconstruction — V3.14
 # -------------------------------------------------------------------
 
 PDF_METADATA_TERMS = (
     "report of operation", "plant name", "owner", "permit number",
     "month:", "year:", "tennessee department", "division of water",
-    "page ",
 )
-
-UNIT_ONLY = {
-    "mgd", "mg/l", "ppm", "inches", "hours", "°c", "(°c)", "%",
-}
-
-CHILD_LIKE = {
-    "avg", "average", "max", "maximum", "min", "minimum",
-    "raw", "inter", "inter.", "intermediate", "final",
-    "reduction", "reduction in %", "influent", "effluent",
-    "total n", "total p", "n soluble", "% ts", "% vs",
-    "alkalinity", "vol. acid", "vol. acids",
-}
+UNIT_ONLY = {"mgd","mg/l","ppm","inches","hours","°c","(°c)","%"}
 
 def _norm_header(text):
     text = re.sub(r"\s+", " ", clean_text(str(text))).strip(" -_")
-    repl = {
-        "average": "Avg",
-        "maximum": "Max",
-        "minimum": "Min",
-        "intermediate": "Inter.",
-        "inter": "Inter.",
-    }
-    return repl.get(text.lower(), text)
+    return {
+        "average":"Avg","maximum":"Max","minimum":"Min",
+        "intermediate":"Inter.","inter":"Inter.",
+    }.get(text.lower(), text)
 
 def _is_metadata_text(text):
     low = _norm_header(text).lower()
-    return any(term in low for term in PDF_METADATA_TERMS)
+    return (
+        bool(low) and (
+            any(term in low for term in PDF_METADATA_TERMS)
+            or bool(re.fullmatch(r"(19|20)\d{2}", low))
+            or bool(re.fullmatch(r"page\s*\d+", low))
+        )
+    )
 
 def _row_text(row):
-    return " ".join(
-        _norm_header(w.get("text", ""))
-        for w in row.get("words", [])
-        if _norm_header(w.get("text", ""))
-    ).strip()
+    return " ".join(_norm_header(w.get("text","")) for w in row.get("words",[])).strip()
 
-def _header_table_zone(all_rows, first_data_top, max_height=125.0):
-    """
-    Keep only rows immediately above the daily data table.
-    Report metadata (Month, Year, Plant Name, Permit, Page) is explicitly
-    excluded so values such as '2021' can never become field names.
-    """
-    candidates = []
-    lower = first_data_top - max_height
+def _header_table_zone(all_rows, first_data_top, max_height=145.0):
+    candidates=[]
     for row in all_rows:
-        top = float(row.get("top", 0))
-        if not (lower <= top < first_data_top):
+        top=float(row.get("top",0))
+        if not (first_data_top-max_height <= top < first_data_top):
             continue
-        text = _row_text(row)
+        text=_row_text(row)
         if not text or _is_metadata_text(text):
             continue
-
-        # Reject rows dominated by report metadata/numbers rather than headers.
-        words = [_norm_header(w.get("text", "")) for w in row.get("words", [])]
-        words = [w for w in words if w]
+        words=[_norm_header(w.get("text","")) for w in row.get("words",[])]
+        words=[w for w in words if w and not _is_metadata_text(w)]
         if not words:
             continue
-        numericish = sum(bool(re.fullmatch(r"[\d/:.-]+", w)) for w in words)
-        if numericish > max(2, len(words) // 2):
+        numericish=sum(bool(re.fullmatch(r"[\d/:.,-]+",w)) for w in words)
+        if numericish > max(2,int(len(words)*0.60)):
             continue
-
         candidates.append(row)
-
-    # Use the closest header rows to the daily data. Four levels are enough
-    # for parent -> child -> unit while avoiding report title metadata.
-    candidates = sorted(candidates, key=lambda r: float(r.get("top", 0)))
-    return candidates[-4:]
+    candidates.sort(key=lambda r: float(r.get("top",0)))
+    return candidates[-6:]
 
 def _row_words(row):
-    out = []
-    for w in row.get("words", []):
-        text = _norm_header(w.get("text", ""))
+    out=[]
+    for w in row.get("words",[]):
+        text=_norm_header(w.get("text",""))
         if not text or _is_metadata_text(text):
             continue
-        x0 = float(w.get("x0", word_center(w)))
-        x1 = float(w.get("x1", word_center(w)))
-        out.append({"text": text, "x0": x0, "x1": x1, "xc": (x0+x1)/2})
-    return sorted(out, key=lambda z: z["x0"])
+        x0=float(w.get("x0",word_center(w))); x1=float(w.get("x1",word_center(w)))
+        out.append({"text":text,"x0":x0,"x1":x1,"xc":(x0+x1)/2})
+    return sorted(out,key=lambda z:z["x0"])
 
-def _group_row_phrases(row, gap=11.0):
-    """Group adjacent words into visual header phrases."""
-    words = _row_words(row)
-    if not words:
-        return []
-    groups = [[words[0]]]
+def _group_row_phrases(row, gap=7.0):
+    words=_row_words(row)
+    if not words: return []
+    groups=[[words[0]]]
     for w in words[1:]:
-        prev = groups[-1][-1]
-        if w["x0"] - prev["x1"] <= gap:
+        if w["x0"]-groups[-1][-1]["x1"] <= gap:
             groups[-1].append(w)
         else:
             groups.append([w])
-
-    phrases = []
+    out=[]
     for g in groups:
-        text = " ".join(x["text"] for x in g).strip()
-        phrases.append({
-            "text": text,
-            "x0": min(x["x0"] for x in g),
-            "x1": max(x["x1"] for x in g),
-            "xc": (min(x["x0"] for x in g) + max(x["x1"] for x in g))/2,
-        })
-    return phrases
+        text=_norm_header(" ".join(x["text"] for x in g))
+        if text and not _is_metadata_text(text):
+            x0=min(x["x0"] for x in g); x1=max(x["x1"] for x in g)
+            out.append({"text":text,"x0":x0,"x1":x1,"xc":(x0+x1)/2})
+    return out
 
-def _nearest_phrase_for_column(phrases, anchor, left, right):
-    if not phrases:
-        return None
+def _median_anchor_gap(anchors):
+    gaps=[b-a for a,b in zip(anchors,anchors[1:]) if b>a]
+    if not gaps: return 35.0
+    gaps=sorted(gaps)
+    return gaps[len(gaps)//2]
 
-    # First preference: phrase center physically lies in this child column.
-    inside = [p for p in phrases if left <= p["xc"] <= right]
-    if inside:
-        return min(inside, key=lambda p: abs(p["xc"] - anchor))
-
-    # Second preference: a parent band centered near the child region.
-    width = (right-left) if (left > -1e8 and right < 1e8) else 35.0
-    nearest = min(phrases, key=lambda p: abs(p["xc"] - anchor))
-    if abs(nearest["xc"] - anchor) <= max(35.0, width*1.6):
-        return nearest
-    return None
-
-def _assign_parent_bands(header_rows, anchors):
+def _phrase_bands_for_row(row, anchors):
     """
-    Infer parent spans from the upper header rows.
+    Map one visual header row to the columns below it.
 
-    A parent heading such as 'Effluent Flows, MGD' is assigned to all child
-    anchors until the midpoint between it and the next parent heading.
+    Sparse intermediate headings (e.g. NH3-N above only Comp.) are local and
+    cannot spread across unrelated pH/Influent columns. Rows with several
+    headings use whitespace boundaries between their actual text boxes.
     """
-    if not header_rows:
-        return {}
+    phrases=_group_row_phrases(row)
+    if not phrases: return {}
+    mapped={}
+    gap=_median_anchor_gap(anchors)
 
-    # The uppermost useful row normally carries the broad parent bands.
-    parent_candidates = []
-    for row in header_rows[:-1] if len(header_rows) > 1 else header_rows:
-        for p in _group_row_phrases(row):
-            low = p["text"].lower()
-            if low in CHILD_LIKE or low in UNIT_ONLY:
-                continue
-            if re.fullmatch(r"[\d/:.-]+", p["text"]):
-                continue
-            # Require descriptive text; prevents isolated values such as 2021.
-            if not re.search(r"[A-Za-z]{2,}", p["text"]):
-                continue
-            parent_candidates.append(p)
+    if len(phrases)==1:
+        p=phrases[0]
+        # Local influence for a lone sub-heading. The expansion is enough to
+        # catch centered child columns but not enough to claim the whole table.
+        pad=max(14.0,min(0.75*gap,32.0))
+        left=p["x0"]-pad; right=p["x1"]+pad
+        candidates=[(j,a) for j,a in enumerate(anchors) if left <= a <= right]
+        if not candidates:
+            j,a=min(enumerate(anchors),key=lambda ja:abs(ja[1]-p["xc"]))
+            if abs(a-p["xc"]) <= max(22.0,gap):
+                candidates=[(j,a)]
+        for j,_ in candidates:
+            mapped[j]=p["text"]
+        return mapped
 
-    if not parent_candidates:
-        return {}
-
-    # Prefer the row/phrases closest to the child row, then de-duplicate by center.
-    parent_candidates = sorted(parent_candidates, key=lambda p: p["xc"])
-    dedup = []
-    for p in parent_candidates:
-        if not dedup or abs(p["xc"] - dedup[-1]["xc"]) > 18:
-            dedup.append(p)
-        elif len(p["text"]) > len(dedup[-1]["text"]):
-            dedup[-1] = p
-
-    bands = {}
-    for i, p in enumerate(dedup):
-        # Bound each parent using the gap between its visual box and the next
-        # parent's visual box, not just the heading centers. This respects
-        # asymmetric/wide labels such as "Suspended Solids" beside "Set Solids".
-        if i == 0:
-            left = -1e9
-        else:
-            left = (dedup[i-1]["x1"] + p["x0"]) / 2
-
-        if i == len(dedup)-1:
-            right = 1e9
-        else:
-            right = (p["x1"] + dedup[i+1]["x0"]) / 2
-
-        for j, a in enumerate(anchors):
+    for i,p in enumerate(phrases):
+        left=-1e9 if i==0 else (phrases[i-1]["x1"]+p["x0"])/2
+        right=1e9 if i==len(phrases)-1 else (p["x1"]+phrases[i+1]["x0"])/2
+        for j,a in enumerate(anchors):
             if left <= a <= right:
-                bands[j] = p["text"]
-    return bands
+                mapped[j]=p["text"]
+    return mapped
+
+def _clean_header_path(parts):
+    cleaned=[]
+    for raw in parts:
+        p=_norm_header(raw)
+        if not p or _is_metadata_text(p): continue
+        low=p.lower()
+        if low in UNIT_ONLY and any(low in q.lower() for q in cleaned):
+            continue
+        if cleaned and low==cleaned[-1].lower():
+            continue
+        cleaned.append(p)
+    return cleaned
 
 def build_hierarchical_pdf_headers(anchors, header_rows):
     """
-    Return one unambiguous field name per numeric column.
-
-    Broad parent headings are assigned by horizontal band. Child headings are
-    assigned independently to each numeric x-anchor, so neighboring children
-    such as Final / Reduction in % are never merged together.
+    Build Parent -> Sub-parent -> Child paths from native PDF geometry.
+    Uncertain columns are named Review Column N rather than guessed.
     """
-    if not anchors:
-        return []
-
-    parent_by_idx = _assign_parent_bands(header_rows, anchors)
-    child_row = header_rows[-1] if header_rows else {"words": []}
-    child_words = _row_words(child_row)
-
-    # For each anchor, collect only words whose centers fall inside that
-    # column's midpoint boundaries. This is the critical difference from
-    # phrase grouping: adjacent child columns remain distinct.
-    names = []
-    for i, anchor in enumerate(anchors):
-        left = -1e9 if i == 0 else (anchors[i-1] + anchor) / 2
-        right = 1e9 if i == len(anchors)-1 else (anchor + anchors[i+1]) / 2
-
-        own = [w for w in child_words if left <= w["xc"] <= right]
-        if own:
-            child = _norm_header(" ".join(w["text"] for w in own))
-        else:
-            # Very short centered labels can fall just outside a midpoint due
-            # to PDF text-box geometry. Permit only a tight nearest fallback.
-            nearest = min(child_words, key=lambda w: abs(w["xc"]-anchor), default=None)
-            child = (
-                _norm_header(nearest["text"])
-                if nearest is not None and abs(nearest["xc"]-anchor) <= 16.0
-                else ""
-            )
-
-        parent = _norm_header(parent_by_idx.get(i, ""))
-
-        if _is_metadata_text(parent):
-            parent = ""
-        if _is_metadata_text(child):
-            child = ""
-
-        if child.lower() == "date":
-            names.append("Date")
-            continue
-
-        if parent and child and parent.lower() != child.lower():
-            name = f"{parent} {child}"
-        elif child:
-            name = child
-        elif parent:
-            name = parent
-        else:
-            name = f"Column {i+1}"
-
-        names.append(re.sub(r"\s+", " ", name).strip())
-
+    if not anchors: return []
+    row_maps=[_phrase_bands_for_row(row,anchors) for row in header_rows]
+    names=[]
+    for j,_ in enumerate(anchors):
+        path=_clean_header_path([m.get(j,"") for m in row_maps])
+        names.append(" ".join(path).strip() if path else f"Review Column {j+1}")
     return make_unique(names)
 
 
@@ -492,8 +394,18 @@ def extract_generic_page(page, page_no: int, source_name: str) -> DetectedDatase
     be merged with Page 3 merely because their layouts look similar.
     """
     date_rows, all_rows = extract_date_rows(page)
-    if len(date_rows) < 2:
-        return None
+    if not date_rows:
+        return DetectedDataset(
+            name=f"PDF Page {page_no}",
+            source_name=source_name,
+            dataframe=pd.DataFrame({"Date": pd.Series(dtype="datetime64[ns]")}),
+            confidence="Review required",
+            notes=[
+                f"Physical PDF page {page_no} was preserved.",
+                "No daily date rows were confidently detected.",
+                "The page was not silently dropped.",
+            ],
+        )
 
     value_x = []
     date_anchor = None
@@ -509,7 +421,24 @@ def extract_generic_page(page, page_no: int, source_name: str) -> DetectedDatase
 
     anchors = cluster_positions(value_x, tolerance=10.5)
     if not anchors:
-        return None
+        dates=[]
+        for row in date_rows:
+            for w in row["words"]:
+                text=clean_text(w["text"])
+                if DATE_RE.match(text):
+                    dates.append(pd.to_datetime(text,errors="coerce"))
+                    break
+        return DetectedDataset(
+            name=f"PDF Page {page_no}",
+            source_name=source_name,
+            dataframe=pd.DataFrame({"Date":dates}),
+            confidence="Review required",
+            notes=[
+                f"Physical PDF page {page_no} was preserved.",
+                "Dates were detected but value columns were too sparse to name safely.",
+                "No field names were invented.",
+            ],
+        )
 
     first_top = min(r["top"] for r in date_rows)
 
@@ -562,8 +491,6 @@ def extract_generic_page(page, page_no: int, source_name: str) -> DetectedDatase
             records.append(record)
 
     df = pd.DataFrame(records, columns=labels)
-    if len(df) < 2 or len(df.columns) < 2:
-        return None
 
     return DetectedDataset(
         name=f"PDF Page {page_no}",
@@ -572,8 +499,8 @@ def extract_generic_page(page, page_no: int, source_name: str) -> DetectedDatase
         confidence="Review required",
         notes=[
             f"Extracted strictly from physical PDF page {page_no}.",
-            "Columns were inferred only from this page's repeated x-positions and header text.",
-            "Physical PDF pages are kept separate before any cross-file monthly combining.",
+            "Multi-level headers were reconstructed from native PDF text geometry.",
+            "Selected physical PDF pages are kept separate and never silently dropped.",
             "Confirm sample values before exporting.",
         ],
     )
@@ -617,26 +544,15 @@ MONTH_LOOKUP = {
 
 
 def get_pdf_page_info(data: bytes) -> dict:
-    """
-    Lightweight PDF inspection used by the Streamlit UI before extraction.
-    A PDF is considered scanned/image-based when almost no embedded text is
-    available on the first few pages.
-    """
-    import fitz
-
-    doc = fitz.open(stream=data, filetype="pdf")
-    page_count = len(doc)
-    sample_pages = min(page_count, 3)
-    text_chars = 0
-
-    for i in range(sample_pages):
-        try:
-            text_chars += len((doc[i].get_text("text") or "").strip())
-        except Exception:
-            pass
-
-    doc.close()
-
+    """Inspect physical PDF pages without OCR/PyMuPDF."""
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        page_count = len(pdf.pages)
+        text_chars = 0
+        for i in range(min(page_count, 3)):
+            try:
+                text_chars += len((pdf.pages[i].extract_text() or "").strip())
+            except Exception:
+                pass
     return {
         "page_count": page_count,
         "is_scanned": text_chars < 80,

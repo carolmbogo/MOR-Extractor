@@ -12,6 +12,7 @@ from streamlit_sortables import sort_items
 from streamlit_local_storage import LocalStorage
 
 from mor_parser import (
+    DetectedDataset,
     combine_same_named_datasets,
     detect_file,
     get_excel_sheet_names,
@@ -676,6 +677,23 @@ if uploads:
                 )
                 if not detected:
                     errors.append(f"{name}: no usable daily table was detected.")
+
+                if Path(name).suffix.lower() == ".pdf" and selected_pdf_pages:
+                    returned = {ds.name for ds in detected}
+                    for page_no in selected_pdf_pages:
+                        expected_name = f"PDF Page {page_no}"
+                        if expected_name not in returned:
+                            detected.append(DetectedDataset(
+                                name=expected_name,
+                                source_name=name,
+                                dataframe=pd.DataFrame({"Date": pd.Series(dtype="datetime64[ns]")}),
+                                confidence="Review required",
+                                notes=[
+                                    f"Physical PDF page {page_no} was selected and preserved.",
+                                    "Automatic table reconstruction was inconclusive.",
+                                    "No columns were reassigned to another page.",
+                                ],
+                            ))
                 datasets.extend(detected)
 
             except Exception as exc:
