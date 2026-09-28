@@ -488,7 +488,41 @@ def build_hierarchical_pdf_headers(anchors, header_rows):
         else:
             names.append(f"Review Column {j+1}")
 
-    return make_unique(names)
+    # Repair sibling groups after geometry reconstruction.  Native MOR forms
+    # commonly print a parent once above repeated children (Avg/Max/Min,
+    # Raw/Inter./Final).  A narrow centered parent can geometrically land on
+    # only the middle child; when that happens, propagate the same parent to
+    # the adjacent siblings instead of leaving ambiguous standalone names.
+    generic_children = {"avg", "max", "min", "raw", "inter.", "inter", "final"}
+    repaired = list(names)
+    for j, name in enumerate(names):
+        parts = _clean_header_path(name.split())
+        if not parts:
+            continue
+        leaf = parts[-1].lower()
+        if leaf not in generic_children or len(parts) < 2:
+            continue
+        parent = " ".join(parts[:-1]).strip()
+        if not parent:
+            continue
+        # Walk left/right only through immediately adjacent generic siblings.
+        for direction in (-1, 1):
+            k = j + direction
+            while 0 <= k < len(names):
+                candidate = _norm_header(names[k])
+                cand_low = candidate.lower()
+                if cand_low not in generic_children:
+                    break
+                repaired[k] = f"{parent} {candidate}"
+                k += direction
+
+    # Remove accidental Date leakage from the Rainfall child header.
+    repaired = [
+        re.sub(r"^Rainfall\s+Date\s+", "Rainfall ", n, flags=re.I)
+        for n in repaired
+    ]
+
+    return make_unique(repaired)
 
 
 def extract_generic_page(page, page_no: int, source_name: str) -> DetectedDataset | None:
@@ -1419,6 +1453,91 @@ def extract_scanned_pdf(data: bytes, source_name: str, selected_pages=None):
     return out
 
 
+
+KUB_PAGE1_CANONICAL_HEADERS = [
+    "Date",
+    "Rainfall Inches",
+    "Influent Flows, MGD Avg",
+    "Influent Flows, MGD Max",
+    "Influent Flows, MGD Min",
+    "Bypass Hours",
+    "Influent Temp (°C)",
+    "Effluent Flows, MGD Avg",
+    "Effluent Flows, MGD Max",
+    "Effluent Flows, MGD Min",
+    "5-Day CBOD Raw",
+    "5-Day CBOD Inter.",
+    "5-Day CBOD Final",
+    "5-Day CBOD Reduction in %",
+    "Suspended Solids Raw",
+    "Suspended Solids Inter.",
+    "Suspended Solids Final",
+    "Suspended Solids Reduction in %",
+    "Set Solids Raw",
+    "Set Solids Inter.",
+    "Set Solids Final",
+    "pH Raw",
+    "pH Inter.",
+    "pH Final",
+    "Influent Parameters Total N",
+    "Influent Parameters Total P",
+    "Final Effluent Parameters E-Coli",
+    "Final Effluent Parameters Cl2 Resid.",
+    "Final Effluent Parameters Lbs Cl2",
+    "Final Effluent Parameters NH3-N Comp.",
+    "Final Effluent Parameters Total N",
+    "Final Effluent Parameters Total P",
+    "Final Effluent Parameters DO",
+]
+
+KUB_PAGE2_CANONICAL_HEADERS = [
+    "Date",
+    "Influent NH3-N PPM",
+    "Grease Inf. PPM",
+    "Grease Eff. PPM",
+    "Secondary System MLSS PPM",
+    "Secondary System Return SS",
+    "Secondary System SVI",
+    "Secondary System 30 Min Set. Sol.",
+    "Digested Sludge % TS",
+    "Digested Sludge % VS",
+    "Wet Sludge To Digester (1000's of Gallons)",
+    "Digester Influent % TS",
+    "Digester Influent % VS",
+    "In Digester % TS",
+    "In Digester % VS",
+    "Digester No. 2 pH",
+    "Digester No. 2 Alkalinity PPM",
+    "Digester No. 2 Vol. Acids PPM",
+    "Digester No. 4 pH",
+    "Digester No. 4 Alkalinity PPM",
+    "Digester No. 4 Vol. Acids PPM",
+    "Digester No. 6 pH",
+    "Digester No. 6 Alkalinity PPM",
+    "Digester No. 6 Vol. Acids PPM",
+    "Anaerobic Digester Detention Time, Days",
+]
+
+
+def _apply_recognized_kub_page1_headers(datasets):
+    """Lock verified native-text KUB page 1 and page 2 header hierarchies.
+
+    The values and physical columns still come from the PDF geometry parser.
+    Only the labels are replaced, and only when the detected column count
+    exactly matches the verified form. This prevents generic child labels such
+    as Avg/Min/Raw/Final from losing their parent heading.
+    """
+    verified = {
+        "PDF Page 1": KUB_PAGE1_CANONICAL_HEADERS,
+        "PDF Page 2": KUB_PAGE2_CANONICAL_HEADERS,
+    }
+    for ds in datasets:
+        headers = verified.get(ds.name)
+        if headers and len(ds.dataframe.columns) == len(headers):
+            ds.dataframe.columns = headers
+            ds.confidence = "High"
+    return datasets
+
 def extract_pdf(data: bytes, source_name: str, selected_pages=None) -> list[DetectedDataset]:
     """
     Parse PDFs page-by-page. The physical PDF page count and selected physical
@@ -1438,11 +1557,23 @@ def extract_pdf(data: bytes, source_name: str, selected_pages=None) -> list[Dete
             "OCR extraction is disabled for reliability."
         )
 
-    return extract_generic_pdf(
+    datasets = extract_generic_pdf(
         data,
         source_name,
         selected_pages=pages,
     )
+
+    # The KUB/Fourth Creek form is a known native-text MOR layout.  Lock its
+    # page-1 parent/child names to the verified hierarchy so Avg/Max/Min and
+    # Raw/Inter./Final can never regress to ambiguous standalone labels.
+    try:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            if is_kub_fourth_creek(pdf):
+                datasets = _apply_recognized_kub_page1_headers(datasets)
+    except Exception:
+        pass
+
+    return datasets
 
 
 # ----------------------------
