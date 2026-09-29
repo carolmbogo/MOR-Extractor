@@ -1,6 +1,7 @@
 
 import io
 import hashlib
+import importlib
 import re
 from pathlib import Path
 
@@ -8,18 +9,23 @@ import pandas as pd
 import streamlit as st
 from streamlit_sortables import sort_items
 
-from mor_parser import (
-    DetectedDataset,
-    combine_same_named_datasets,
-    detect_file,
-    get_excel_sheet_names,
-    get_pdf_page_info,
-    unpack_upload,
-)
+import mor_parser as _mor_parser
+
+
+# Streamlit can rerun app.py in an existing Python process after a deployment.
+# Reload the parser module so the running app cannot keep an older parser in
+# memory while displaying the newer interface.
+_mor_parser = importlib.reload(_mor_parser)
+DetectedDataset = _mor_parser.DetectedDataset
+combine_same_named_datasets = _mor_parser.combine_same_named_datasets
+detect_file = _mor_parser.detect_file
+get_excel_sheet_names = _mor_parser.get_excel_sheet_names
+get_pdf_page_info = _mor_parser.get_pdf_page_info
+unpack_upload = _mor_parser.unpack_upload
 
 
 APP_TITLE = "MORganizer 3000"
-PARSER_SCHEMA_VERSION = "kub-fixed-layout-v2"
+PARSER_SCHEMA_VERSION = "kub-fixed-layout-v3"
 
 
 # Parsed tables and field-picker state can survive a Streamlit code rerun. Clear

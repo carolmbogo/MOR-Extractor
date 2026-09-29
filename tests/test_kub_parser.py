@@ -9,6 +9,7 @@ from mor_parser import (
     KUB_PAGE3_FIELDS,
     combine_same_named_datasets,
     extract_known_page,
+    is_kub_fourth_creek,
 )
 
 
@@ -18,6 +19,19 @@ class FakePage:
 
     def extract_words(self, **_kwargs):
         return self.words
+
+
+class FakeTextPage:
+    def __init__(self, text):
+        self.text = text
+
+    def extract_text(self):
+        return self.text
+
+
+class FakePdf:
+    def __init__(self, page_texts):
+        self.pages = [FakeTextPage(text) for text in page_texts]
 
 
 def word(text, center, top=100.0):
@@ -30,6 +44,24 @@ def word(text, center, top=100.0):
 
 
 class KnownKubParserTests(unittest.TestCase):
+    def test_three_page_fingerprint_recognizes_monthly_text_variations(self):
+        pdf = FakePdf([
+            (
+                "Report of Operation of Wastewater Treatment Plant\n"
+                "Influent Flows, MGD\nSet Solids\nFinal Effluent Parameters"
+            ),
+            (
+                "Secondary System Digested Sludge Digester Influent "
+                "Digester No. 2 Digester No. 4 Digester No. 6"
+            ),
+            (
+                "Cadmium Chromium Copper Nickel Zinc Silver Lead "
+                "Filter Press Solids Disposal"
+            ),
+        ])
+
+        self.assertTrue(is_kub_fourth_creek(pdf))
+
     def test_known_page_schemas_are_complete_and_unique(self):
         self.assertEqual(len(KUB_PAGE1_FIELDS), 33)
         self.assertEqual(len(KUB_PAGE2_FIELDS), 25)

@@ -200,19 +200,65 @@ def extract_known_page(page, field_defs, tolerance=16.5) -> pd.DataFrame:
     return pd.DataFrame(records, columns=[f[0] for f in field_defs])
 
 
-def is_kub_fourth_creek(pdf) -> bool:
+def _normalized_pdf_text(page) -> str:
+    """Normalize extracted header text so line breaks and hyphens do not hide a form match."""
     try:
-        text = (pdf.pages[0].extract_text() or "").lower()
+        text = page.extract_text() or ""
     except Exception:
+        return ""
+    text = text.lower().replace("–", "-").replace("—", "-")
+    return re.sub(r"[^a-z0-9%]+", " ", text).strip()
+
+
+def is_kub_fourth_creek(pdf) -> bool:
+    """Identify the recurring three-page Kuwahee/KUB MOR form.
+
+    Monthly files do not always expose Page 1 text in exactly the same order.
+    Use the complete three-page header fingerprint so one small text-extraction
+    variation cannot send an otherwise identical month to the generic parser.
+    """
+    if len(getattr(pdf, "pages", [])) < 3:
         return False
-    required = [
+
+    page1 = _normalized_pdf_text(pdf.pages[0])
+    page2 = _normalized_pdf_text(pdf.pages[1])
+    page3 = _normalized_pdf_text(pdf.pages[2])
+
+    page1_terms = [
         "report of operation of wastewater treatment plant",
         "influent flows",
         "set solids",
         "final effluent parameters",
     ]
-    has_cbod = "5-day cbod" in text or "5-day bod" in text
-    return sum(term in text for term in required) >= 3 and has_cbod
+    page1_score = sum(term in page1 for term in page1_terms)
+    has_bod = "5 day cbod" in page1 or "5 day bod" in page1
+
+    page2_terms = [
+        "secondary system",
+        "digested sludge",
+        "digester influent",
+        "digester no 2",
+        "digester no 4",
+        "digester no 6",
+    ]
+    page2_score = sum(term in page2 for term in page2_terms)
+
+    page3_terms = [
+        "cadmium",
+        "chromium",
+        "copper",
+        "nickel",
+        "zinc",
+        "silver",
+        "lead",
+        "filter press",
+        "solids disposal",
+    ]
+    page3_score = sum(term in page3 for term in page3_terms)
+
+    strong_page1_match = page1_score >= 3 and has_bod
+    full_form_match = page1_score >= 2 and page2_score >= 4 and page3_score >= 7
+    return strong_page1_match or full_form_match
 
 
 def extract_kub_pdf(
