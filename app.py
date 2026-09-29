@@ -67,6 +67,7 @@ def is_percentage_column(column_name: str) -> bool:
     return "%" in name or "percent" in name or "percentage" in name
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
     """Build the downloadable Excel workbook without changing the preview data."""
     output = io.BytesIO()
@@ -494,6 +495,7 @@ if stored:
                 "calendar_crosscheck_flags",
                 "export_filename_input",
                 "export_filename_committed",
+                "file_inspection_cache",
             ]:
                 st.session_state.pop(key, None)
 
@@ -525,6 +527,7 @@ if uploads:
         st.session_state.pop("calendar_crosscheck_flags", None)
         st.session_state.pop("export_filename_input", None)
         st.session_state.pop("export_filename_committed", None)
+        st.session_state.pop("file_inspection_cache", None)
 
         for key in list(st.session_state.keys()):
             if (
@@ -542,6 +545,23 @@ if uploads:
 
     items = st.session_state["prepared_items"]
     prep_errors = st.session_state.get("prep_errors", [])
+
+    # Reuse file metadata across Streamlit reruns. Selecting a field, naming an
+    # export, or clicking another widget should not reopen dozens of PDFs/Excel
+    # files just to rediscover page counts or worksheet names.
+    if "file_inspection_cache" not in st.session_state:
+        st.session_state["file_inspection_cache"] = {
+            "pdf": {},
+            "excel": {},
+        }
+    inspection_cache = st.session_state["file_inspection_cache"]
+    inspection_cache.setdefault("pdf", {})
+    inspection_cache.setdefault("excel", {})
+
+    # The upload signature reset above clears this cache whenever the actual
+    # file set changes, so name + byte length is sufficient within one batch.
+    def inspection_key(name, data):
+        return (name, len(data))
 
     # ---------------------------------------------------------------
     # Upload calendar QC — filename first, extracted-date fallback after detection
@@ -602,11 +622,25 @@ if uploads:
         sheet_errors = []
 
         for name, data in excel_items:
-            try:
-                sheet_lists[name] = get_excel_sheet_names(name, data)
-            except Exception as exc:
-                sheet_lists[name] = []
-                sheet_errors.append(f"{name}: {exc}")
+            cache_key = inspection_key(name, data)
+            cached = inspection_cache["excel"].get(cache_key)
+
+            if cached is None:
+                try:
+                    cached = {
+                        "sheet_names": get_excel_sheet_names(name, data),
+                        "error": None,
+                    }
+                except Exception as exc:
+                    cached = {
+                        "sheet_names": [],
+                        "error": f"{name}: {exc}",
+                    }
+                inspection_cache["excel"][cache_key] = cached
+
+            sheet_lists[name] = cached["sheet_names"]
+            if cached.get("error"):
+                sheet_errors.append(cached["error"])
 
         for err in sheet_errors:
             st.error(f"Could not read worksheet names from {err}")
@@ -762,10 +796,26 @@ if uploads:
         pdf_info_by_file = {}
 
         for name, data in pdf_items:
-            try:
-                pdf_info_by_file[name] = get_pdf_page_info(data)
-            except Exception as exc:
-                prep_errors.append(f"{name}: could not inspect PDF pages ({exc})")
+            cache_key = inspection_key(name, data)
+            cached = inspection_cache["pdf"].get(cache_key)
+
+            if cached is None:
+                try:
+                    cached = {
+                        "info": get_pdf_page_info(data),
+                        "error": None,
+                    }
+                except Exception as exc:
+                    cached = {
+                        "info": None,
+                        "error": f"{name}: could not inspect PDF pages ({exc})",
+                    }
+                inspection_cache["pdf"][cache_key] = cached
+
+            if cached.get("info") is not None:
+                pdf_info_by_file[name] = cached["info"]
+            if cached.get("error") and cached["error"] not in prep_errors:
+                prep_errors.append(cached["error"])
 
         scanned_pdf_count = sum(
             1 for name, _ in pdf_items
