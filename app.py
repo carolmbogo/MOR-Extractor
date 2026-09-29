@@ -1489,13 +1489,21 @@ if "datasets" in st.session_state:
     st.caption(f'Your files will download as **{safe_stem}.xlsx** or **{safe_stem}.csv**.')
 
     xlsx = to_excel_bytes(preview)
+    # The download widget identity must change when the filename changes.
+    # Otherwise Streamlit can keep the previous download metadata even though
+    # the text/caption on screen has already updated.
+    download_key_suffix = hashlib.md5(
+        safe_stem.encode("utf-8")
+    ).hexdigest()[:12]
+
     st.download_button(
         "Download Excel",
         data=xlsx,
         file_name=f"{safe_stem}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
-        key="download_excel_final",
+        key=f"download_excel_{download_key_suffix}",
+        on_click="ignore",
     )
 
     st.download_button(
@@ -1503,5 +1511,6 @@ if "datasets" in st.session_state:
         data=preview.to_csv(index=False, na_rep="").encode("utf-8"),
         file_name=f"{safe_stem}.csv",
         mime="text/csv",
-        key="download_csv_final",
+        key=f"download_csv_{download_key_suffix}",
+        on_click="ignore",
     )
