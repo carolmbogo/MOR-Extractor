@@ -19,6 +19,27 @@ from mor_parser import (
 
 
 APP_TITLE = "MORganizer 3000"
+PARSER_SCHEMA_VERSION = "kub-fixed-layout-v2"
+
+
+# Parsed tables and field-picker state can survive a Streamlit code rerun. Clear
+# results created by an older parser schema so a deployment never keeps showing
+# obsolete fused headers or an outdated two-page picker.
+if st.session_state.get("_parser_schema_version") != PARSER_SCHEMA_VERSION:
+    stale_keys = {
+        "datasets",
+        "errors",
+        "global_field_order",
+        "active_dataset_for_field_selection",
+    }
+    for state_key in list(st.session_state):
+        if (
+            state_key in stale_keys
+            or state_key.startswith("selected_fields_dataset_")
+            or state_key.startswith("picker_widget_dataset_")
+        ):
+            st.session_state.pop(state_key, None)
+    st.session_state["_parser_schema_version"] = PARSER_SCHEMA_VERSION
 
 
 class StoredUpload:
@@ -809,38 +830,42 @@ if "datasets" in st.session_state:
             + ", ".join(detected_labels)
         )
 
-    active_idx = st.selectbox(
-        "Page / worksheet to choose fields from",
-        options=range(len(datasets)),
-        format_func=lambda i: dataset_labels[i],
-        key="active_dataset_for_field_selection",
-    )
+    # Keep every detected page visible. A single stateful page selector could
+    # retain an older index after a parser update, leaving the field list stuck
+    # on Page 2 even when Page 3 had been detected.
+    for ds_idx, ds in enumerate(datasets):
+        source_df = ds.dataframe
+        options = list(source_df.columns)
+        selection_key = f"selected_fields_dataset_{ds_idx}"
+        picker_key = f"picker_widget_dataset_{ds_idx}"
 
-    active_ds = datasets[active_idx]
-    active_df = active_ds.dataframe.copy()
+        if selection_key not in st.session_state:
+            st.session_state[selection_key] = ["Date"] if "Date" in options else []
 
-    st.caption(
-        f"{len(active_df):,} rows · {len(active_df.columns)} fields"
-        + (" · Review recommended" if "review" in active_ds.confidence.lower() else "")
-    )
+        valid_selection = [
+            field
+            for field in st.session_state.get(selection_key, [])
+            if field in options
+        ]
+        st.session_state[selection_key] = valid_selection
 
-    selection_key = f"selected_fields_dataset_{active_idx}"
-    if selection_key not in st.session_state:
-        if "Date" in active_df.columns:
-            st.session_state[selection_key] = ["Date"]
-        elif "Day" in active_df.columns:
-            st.session_state[selection_key] = []
+        if picker_key not in st.session_state:
+            st.session_state[picker_key] = valid_selection
         else:
-            st.session_state[selection_key] = []
+            st.session_state[picker_key] = [
+                field
+                for field in st.session_state.get(picker_key, [])
+                if field in options
+            ]
 
-    picked_here = st.multiselect(
-        f"Fields from {active_ds.name}",
-        options=list(active_df.columns),
-        default=st.session_state[selection_key],
-        placeholder="Choose one or more fields",
-        key=f"picker_widget_dataset_{active_idx}",
-    )
-    st.session_state[selection_key] = picked_here
+        with st.expander(dataset_labels[ds_idx], expanded=(ds_idx == 0)):
+            picked_here = st.multiselect(
+                f"Fields from {ds.name}",
+                options=options,
+                placeholder="Choose one or more fields",
+                key=picker_key,
+            )
+            st.session_state[selection_key] = picked_here
 
     # Collect selections from every page/sheet.
     selected_specs = []

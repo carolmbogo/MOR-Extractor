@@ -40,6 +40,39 @@ class KnownKubParserTests(unittest.TestCase):
             self.assertEqual(len(names), len(set(names)))
             self.assertEqual(names[0], "Date")
 
+    def test_page_one_parent_headers_trickle_down_without_fused_neighbors(self):
+        names = [name for name, _ in KUB_PAGE1_FIELDS]
+
+        self.assertEqual(
+            names[2:5],
+            [
+                "Influent Flows, MGD Avg",
+                "Influent Flows, MGD Max",
+                "Influent Flows, MGD Min",
+            ],
+        )
+        self.assertEqual(
+            names[24:33],
+            [
+                "Influent Parameters Total N",
+                "Influent Parameters Total P",
+                "Final Effluent Parameters E-Coli",
+                "Final Effluent Parameters Cl2 Resid.",
+                "Final Effluent Parameters Lbs Cl2",
+                "Final Effluent Parameters NH3-N Comp.",
+                "Final Effluent Parameters Total N",
+                "Final Effluent Parameters Total P",
+                "Final Effluent Parameters DO",
+            ],
+        )
+
+        forbidden_fused_headers = {
+            "Influent Total P E-Coli",
+            "Final Effluent Parameters NH3-N Comp. Total N",
+            "Total P DO",
+        }
+        self.assertTrue(forbidden_fused_headers.isdisjoint(names))
+
     def test_page_three_keeps_each_metal_in_its_own_column(self):
         values = {
             "Cadmium Influent mg/L": "0.0020",
