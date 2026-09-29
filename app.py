@@ -1463,48 +1463,30 @@ if "datasets" in st.session_state:
     if len(uploads) == 1:
         default_stem = Path(uploads[0].name).stem + "_extracted"
 
-    # Keep the typed name and the name actually used for downloads separate.
-    # The user explicitly commits the name before downloading, which prevents
-    # the browser from receiving the previous filename when the text box has
-    # not yet triggered a Streamlit rerun.
+    # Naming is intentionally the final step before download. The text currently
+    # in this box is the filename used by both download buttons; there is no
+    # separate "commit" or "apply" step.
     if "export_filename_input" not in st.session_state:
         st.session_state["export_filename_input"] = default_stem
-    if "export_filename_committed" not in st.session_state:
-        st.session_state["export_filename_committed"] = default_stem
 
-    with st.form("export_filename_form", clear_on_submit=False):
-        requested_name = st.text_input(
-            "Name your extracted file",
-            help=(
-                "You do not need to type .xlsx or .csv. "
-                "MORganizer will add the correct extension."
-            ),
-            key="export_filename_input",
-        )
-        apply_name = st.form_submit_button("Use this filename")
+    requested_name = st.text_input(
+        "Name your extracted file",
+        help=(
+            "This is the final step before download. "
+            "You do not need to type .xlsx or .csv."
+        ),
+        key="export_filename_input",
+    )
 
-    if apply_name:
-        safe_requested = sanitize_download_name(
-            requested_name,
-            fallback=default_stem,
-        )
-        st.session_state["export_filename_committed"] = safe_requested
-        st.success(f'Filename set to "{safe_requested}".')
-
-    safe_stem = st.session_state["export_filename_committed"]
-    current_safe_input = sanitize_download_name(
-        st.session_state.get("export_filename_input", ""),
+    safe_stem = sanitize_download_name(
+        requested_name,
         fallback=default_stem,
     )
 
-    if current_safe_input != safe_stem:
-        st.caption(
-            f'Current download name is **{safe_stem}**. '
-            'Click "Use this filename" to apply the name typed above.'
-        )
+    if requested_name.strip() and safe_stem != requested_name.strip():
+        st.caption(f'Filename adjusted to: **{safe_stem}**')
 
-    st.caption(f'Excel download: **{safe_stem}.xlsx**')
-    st.caption(f'CSV download: **{safe_stem}.csv**')
+    st.caption(f'Your files will download as **{safe_stem}.xlsx** or **{safe_stem}.csv**.')
 
     xlsx = to_excel_bytes(preview)
     st.download_button(
@@ -1513,7 +1495,7 @@ if "datasets" in st.session_state:
         file_name=f"{safe_stem}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
-        key=f"download_excel_{safe_stem}",
+        key="download_excel_final",
     )
 
     st.download_button(
@@ -1521,5 +1503,5 @@ if "datasets" in st.session_state:
         data=preview.to_csv(index=False, na_rep="").encode("utf-8"),
         file_name=f"{safe_stem}.csv",
         mime="text/csv",
-        key=f"download_csv_{safe_stem}",
+        key="download_csv_final",
     )
