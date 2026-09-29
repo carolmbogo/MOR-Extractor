@@ -492,6 +492,8 @@ if stored:
                 "prep_errors",
                 "calendar_qc_resolved",
                 "calendar_crosscheck_flags",
+                "export_filename_input",
+                "export_filename_committed",
             ]:
                 st.session_state.pop(key, None)
 
@@ -521,6 +523,8 @@ if uploads:
         st.session_state.pop("prepared_items", None)
         st.session_state.pop("calendar_qc_resolved", None)
         st.session_state.pop("calendar_crosscheck_flags", None)
+        st.session_state.pop("export_filename_input", None)
+        st.session_state.pop("export_filename_committed", None)
 
         for key in list(st.session_state.keys()):
             if (
@@ -1409,42 +1413,63 @@ if "datasets" in st.session_state:
     if len(uploads) == 1:
         default_stem = Path(uploads[0].name).stem + "_extracted"
 
-    # Keep the export name in its own persistent state. This avoids a Streamlit
-    # rerun falling back to MOR_extracted between editing the text box and
-    # clicking a download button.
+    # Keep the typed name and the name actually used for downloads separate.
+    # The user explicitly commits the name before downloading, which prevents
+    # the browser from receiving the previous filename when the text box has
+    # not yet triggered a Streamlit rerun.
+    if "export_filename_input" not in st.session_state:
+        st.session_state["export_filename_input"] = default_stem
     if "export_filename_committed" not in st.session_state:
         st.session_state["export_filename_committed"] = default_stem
 
-    requested_name = st.text_input(
-        "Name your extracted file",
-        value=st.session_state["export_filename_committed"],
-        help="You do not need to type .xlsx or .csv. MORganizer will add the correct extension.",
-        key="custom_export_filename",
+    with st.form("export_filename_form", clear_on_submit=False):
+        requested_name = st.text_input(
+            "Name your extracted file",
+            help=(
+                "You do not need to type .xlsx or .csv. "
+                "MORganizer will add the correct extension."
+            ),
+            key="export_filename_input",
+        )
+        apply_name = st.form_submit_button("Use this filename")
+
+    if apply_name:
+        safe_requested = sanitize_download_name(
+            requested_name,
+            fallback=default_stem,
+        )
+        st.session_state["export_filename_committed"] = safe_requested
+        st.success(f'Filename set to "{safe_requested}".')
+
+    safe_stem = st.session_state["export_filename_committed"]
+    current_safe_input = sanitize_download_name(
+        st.session_state.get("export_filename_input", ""),
+        fallback=default_stem,
     )
 
-    # The current text-box value is authoritative on every rerun.
-    safe_stem = sanitize_download_name(requested_name, fallback=default_stem)
-    st.session_state["export_filename_committed"] = safe_stem
-
-    if requested_name.strip() and safe_stem != requested_name.strip():
-        st.caption(f'Your download filename will be saved as: **{safe_stem}**')
+    if current_safe_input != safe_stem:
+        st.caption(
+            f'Current download name is **{safe_stem}**. '
+            'Click "Use this filename" to apply the name typed above.'
+        )
 
     st.caption(f'Excel download: **{safe_stem}.xlsx**')
+    st.caption(f'CSV download: **{safe_stem}.csv**')
 
     xlsx = to_excel_bytes(preview)
     st.download_button(
         "Download Excel",
         data=xlsx,
-        file_name=safe_stem + ".xlsx",
+        file_name=f"{safe_stem}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
-        key="download_excel_custom_name",
+        key=f"download_excel_{safe_stem}",
     )
 
     st.download_button(
         "Download CSV",
         data=preview.to_csv(index=False, na_rep="").encode("utf-8"),
-        file_name=safe_stem + ".csv",
+        file_name=f"{safe_stem}.csv",
         mime="text/csv",
-        key="download_csv_custom_name",
+        key=f"download_csv_{safe_stem}",
     )
