@@ -22,6 +22,7 @@ detect_file = _mor_parser.detect_file
 get_excel_sheet_names = _mor_parser.get_excel_sheet_names
 get_pdf_page_info = _mor_parser.get_pdf_page_info
 unpack_upload = _mor_parser.unpack_upload
+parse_month_year_from_filename = _mor_parser.parse_month_year_from_filename
 
 
 APP_TITLE = "MORganizer 3000"
@@ -174,6 +175,156 @@ def prepare_items(uploads):
     return items, errors
 
 
+def filename_month_period(filename):
+    """Return the month declared by a MOR filename, without reading file contents."""
+    parsed = parse_month_year_from_filename(filename)
+    if not parsed:
+        return None
+
+    month, year = parsed
+    return pd.Period(f"{year:04d}-{month:02d}", freq="M")
+
+
+def build_filename_calendar_qc(items):
+    """
+    Build upload-calendar QC from filenames only.
+
+    This deliberately does not alter parsing, extracted columns, or extracted
+    dates. Filenames are the source of truth for which monthly MORs were
+    supplied, while extracted dates are checked separately for mismatches.
+    """
+    document_names = [
+        name
+        for name, _ in items
+        if Path(name).suffix.lower() in {".pdf", ".xls", ".xlsx", ".xlsm"}
+    ]
+
+    month_to_files = {}
+    unrecognized_files = []
+
+    for name in document_names:
+        period = filename_month_period(name)
+        if period is None:
+            unrecognized_files.append(name)
+            continue
+        month_to_files.setdefault(period, []).append(name)
+
+    present_months = sorted(month_to_files)
+    missing_months = []
+
+    if len(present_months) >= 2:
+        expected = pd.period_range(present_months[0], present_months[-1], freq="M")
+        missing_months = [period for period in expected if period not in month_to_files]
+
+    duplicate_months = {
+        period: names
+        for period, names in month_to_files.items()
+        if len(names) > 1
+    }
+
+    return {
+        "document_count": len(document_names),
+        "recognized_count": sum(len(names) for names in month_to_files.values()),
+        "present_months": present_months,
+        "missing_months": missing_months,
+        "duplicate_months": duplicate_months,
+        "unrecognized_files": sorted(unrecognized_files),
+    }
+
+
+def filename_calendar_flags(qc):
+    """Convert filename-calendar findings into the standard QA/QC flag format."""
+    flags = []
+
+    missing = qc.get("missing_months", [])
+    if missing:
+        labels = [period.strftime("%B %Y") for period in missing]
+        flags.append({
+            "severity": "warning",
+            "field": "Uploaded files",
+            "issue": "Missing month(s) based on uploaded filenames: " + ", ".join(labels),
+            "count": len(missing),
+        })
+
+    duplicates = qc.get("duplicate_months", {})
+    if duplicates:
+        details = []
+        for period, names in sorted(duplicates.items()):
+            details.append(
+                f"{period.strftime('%B %Y')} ({', '.join(Path(name).name for name in names)})"
+            )
+        flags.append({
+            "severity": "warning",
+            "field": "Uploaded files",
+            "issue": "Multiple files identify the same month: " + "; ".join(details),
+            "count": len(duplicates),
+        })
+
+    unrecognized = qc.get("unrecognized_files", [])
+    if unrecognized:
+        shown = ", ".join(Path(name).name for name in unrecognized[:8])
+        flags.append({
+            "severity": "warning",
+            "field": "Uploaded files",
+            "issue": (
+                f"{len(unrecognized)} filename(s) could not be matched to a MOR month/year: "
+                + shown
+                + ("…" if len(unrecognized) > 8 else "")
+            ),
+            "count": len(unrecognized),
+        })
+
+    return flags
+
+
+def crosscheck_filename_months_against_detected_dates(datasets):
+    """
+    Flag files whose extracted Date values disagree with the month in the filename.
+
+    This is review-only QC. It never changes a date or any extracted value.
+    """
+    by_source = {}
+
+    for ds in datasets:
+        expected = filename_month_period(ds.source_name)
+        if expected is None:
+            continue
+
+        record = by_source.setdefault(
+            ds.source_name,
+            {"expected": expected, "observed": set()},
+        )
+
+        if "Date" not in ds.dataframe.columns:
+            continue
+
+        dates = pd.to_datetime(ds.dataframe["Date"], errors="coerce").dropna()
+        if dates.empty:
+            continue
+
+        observed = pd.PeriodIndex(dates, freq="M").unique()
+        record["observed"].update(observed.tolist())
+
+    flags = []
+    for source_name, record in sorted(by_source.items()):
+        expected = record["expected"]
+        observed = sorted(record["observed"])
+
+        if observed and observed != [expected]:
+            observed_labels = ", ".join(period.strftime("%B %Y") for period in observed)
+            flags.append({
+                "severity": "warning",
+                "field": "Date",
+                "issue": (
+                    f"{Path(source_name).name} identifies {expected.strftime('%B %Y')} "
+                    f"in its filename, but extracted Date values include {observed_labels}."
+                ),
+                "count": len(observed),
+            })
+
+    return flags
+
+
 st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
 
 st.title(APP_TITLE)
@@ -318,6 +469,27 @@ if uploads:
 
     items = st.session_state["prepared_items"]
     prep_errors = st.session_state.get("prep_errors", [])
+
+    # ---------------------------------------------------------------
+    # Upload calendar QC — filenames only; does not touch parsing
+    # ---------------------------------------------------------------
+    filename_calendar_qc = build_filename_calendar_qc(items)
+
+    recognized = filename_calendar_qc["recognized_count"]
+    document_count = filename_calendar_qc["document_count"]
+    present_months = filename_calendar_qc["present_months"]
+
+    if document_count:
+        if present_months:
+            first_month = present_months[0].strftime("%B %Y")
+            last_month = present_months[-1].strftime("%B %Y")
+            st.caption(
+                f"Filename calendar: {recognized}/{document_count} file(s) matched to "
+                f"{len(present_months)} unique month(s), {first_month} through {last_month}."
+            )
+
+        for flag in filename_calendar_flags(filename_calendar_qc):
+            st.warning(flag["issue"])
 
     # ---------------------------------------------------------------
     # Worksheet selection
@@ -598,6 +770,9 @@ if uploads:
 
         progress.empty()
 
+        st.session_state["calendar_crosscheck_flags"] = (
+            crosscheck_filename_months_against_detected_dates(datasets)
+        )
         st.session_state["datasets"] = combine_same_named_datasets(datasets)
         st.session_state["errors"] = errors
 
@@ -647,25 +822,9 @@ def qa_flags(df, original_names_by_output=None):
         if len(valid) >= 2:
             normalized = pd.DatetimeIndex(valid.dt.normalize().unique()).sort_values()
 
-            # Report whole missing months explicitly. This makes arbitrary,
-            # nonconsecutive uploads understandable (e.g. Jan + Apr + Jun).
+            # Whole-month completeness is checked from uploaded filenames above.
+            # Parsed dates are used only for daily gaps inside months that are present.
             present_months = pd.PeriodIndex(normalized, freq="M").unique().sort_values()
-            if len(present_months) >= 2:
-                expected_months = pd.period_range(
-                    present_months.min(),
-                    present_months.max(),
-                    freq="M",
-                )
-                missing_months = expected_months.difference(present_months)
-                if len(missing_months):
-                    month_labels = [p.strftime("%B %Y") for p in missing_months]
-                    flags.append({
-                        "severity": "info",
-                        "field": "Date",
-                        "issue": "Missing month(s) within uploaded date range: "
-                                 + ", ".join(month_labels),
-                        "count": len(missing_months),
-                    })
 
             # Daily gaps are still useful inside months that ARE present, but
             # do not flood QA with every day belonging to a wholly absent month.
@@ -821,19 +980,16 @@ if "datasets" in st.session_state:
         for ds in datasets
     ]
 
-    # Show which calendar months actually survived parsing/combining.
-    all_detected_dates = []
-    for ds in datasets:
-        if "Date" in ds.dataframe.columns:
-            parsed_dates = pd.to_datetime(ds.dataframe["Date"], errors="coerce").dropna()
-            all_detected_dates.extend(parsed_dates.tolist())
-
-    if all_detected_dates:
-        detected_periods = pd.PeriodIndex(all_detected_dates, freq="M").unique().sort_values()
-        detected_labels = [p.strftime("%B %Y") for p in detected_periods]
+    # Month inventory comes from filenames so parser output cannot invent a
+    # month that was never uploaded.
+    if filename_calendar_qc["present_months"]:
+        filename_month_labels = [
+            period.strftime("%B %Y")
+            for period in filename_calendar_qc["present_months"]
+        ]
         st.caption(
-            f"Calendar months loaded ({len(detected_labels)}): "
-            + ", ".join(detected_labels)
+            f"Months identified from uploaded filenames ({len(filename_month_labels)}): "
+            + ", ".join(filename_month_labels)
         )
 
     # Keep every detected page visible. A single stateful page selector could
@@ -1081,7 +1237,10 @@ if "datasets" in st.session_state:
         "It never changes or corrects the extracted data automatically."
     )
 
-    flags = qa_flags(preview, original_names_by_output=renamed_from)
+    flags = []
+    flags.extend(filename_calendar_flags(filename_calendar_qc))
+    flags.extend(st.session_state.get("calendar_crosscheck_flags", []))
+    flags.extend(qa_flags(preview, original_names_by_output=renamed_from))
 
     if flags:
         warning_count = sum(1 for f in flags if f["severity"] == "warning")
