@@ -16,37 +16,89 @@ from openpyxl import load_workbook
 DATE_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}$")
 
 KUB_PAGE1_FIELDS = [
-    ("Date", 43.8), ("Rainfall (in)", 108.3), ("Average Flow (MGD)", 141.8),
-    ("Maximum Flow (MGD)", 175.4), ("Minimum Flow (MGD)", 209.0),
-    ("Bypass Hours", 242.6), ("Influent Temperature (°C)", 276.1),
-    ("BOD Raw (mg/L)", 309.7), ("BOD Intermediate (mg/L)", 343.3),
-    ("BOD Final (mg/L)", 376.8), ("BOD Reduction (%)", 410.4),
-    ("Suspended Solids Raw (mg/L)", 444.0),
-    ("Suspended Solids Intermediate (mg/L)", 477.6),
-    ("Suspended Solids Final (mg/L)", 511.1),
-    ("Suspended Solids Reduction (%)", 544.7),
-    ("Set Solids Raw", 578.3), ("Set Solids Intermediate", 611.9),
-    ("Set Solids Final", 645.4), ("DO (mg/L)", 679.0),
-    ("pH Raw", 712.6), ("pH Intermediate", 746.1), ("pH Final", 779.7),
-    ("NH3-N Influent (ppm)", 813.3), ("Grease Influent (ppm)", 846.9),
-    ("Lbs Cl2", 880.4), ("Total N Influent (mg/L)", 914.0),
-    ("Total P Influent (mg/L)", 947.6), ("E. coli", 981.2),
-    ("Cl2 Residual", 1014.7),
-    ("NH3-N Compliance Final Effluent (ppm)", 1048.3),
-    ("Grease Final Effluent (ppm)", 1081.9), ("Effluent Flow (MGD)", 1115.4),
-    ("Total N Effluent (mg/L)", 1149.0), ("Total P Effluent (mg/L)", 1182.6),
+    ("Date", 43.8),
+    ("Rainfall Inches", 110.6),
+    ("Influent Flows, MGD Avg", 145.2),
+    ("Influent Flows, MGD Max", 179.8),
+    ("Influent Flows, MGD Min", 214.3),
+    ("Bypass Hours", 248.9),
+    ("Influent Temp (°C)", 283.4),
+    ("Effluent Flows, MGD Avg", 318.0),
+    ("Effluent Flows, MGD Max", 352.6),
+    ("Effluent Flows, MGD Min", 387.1),
+    ("5-Day CBOD Raw", 421.7),
+    ("5-Day CBOD Inter.", 456.2),
+    ("5-Day CBOD Final", 490.8),
+    ("5-Day CBOD Reduction in %", 525.4),
+    ("Suspended Solids Raw", 559.9),
+    ("Suspended Solids Inter.", 594.5),
+    ("Suspended Solids Final", 629.0),
+    ("Suspended Solids Reduction in %", 663.6),
+    ("Set Solids Raw", 698.2),
+    ("Set Solids Inter.", 732.7),
+    ("Set Solids Final", 767.3),
+    ("pH Raw", 801.8),
+    ("pH Inter.", 836.4),
+    ("pH Final", 871.0),
+    ("Influent Parameters Total N", 905.5),
+    ("Influent Parameters Total P", 940.1),
+    ("Final Effluent Parameters E-Coli", 974.6),
+    ("Final Effluent Parameters Cl2 Resid.", 1009.2),
+    ("Final Effluent Parameters Lbs Cl2", 1043.8),
+    ("Final Effluent Parameters NH3-N Comp.", 1078.3),
+    ("Final Effluent Parameters Total N", 1112.9),
+    ("Final Effluent Parameters Total P", 1147.4),
+    ("Final Effluent Parameters DO", 1182.0),
 ]
 
 KUB_PAGE2_FIELDS = [
-    ("Date", 43.8), ("Secondary System DO (ppm)", 164.3), ("MLSS (ppm)", 220.2),
-    ("SVI", 276.2), ("30 Minute Set Solids", 332.2), ("Waste (GPD)", 388.1),
-    ("Cadmium Influent (mg/L)", 444.1), ("Cadmium Effluent (mg/L)", 500.0),
-    ("Chromium Influent (mg/L)", 556.0), ("Chromium Effluent (mg/L)", 611.9),
-    ("Copper Influent (mg/L)", 667.9), ("Copper Effluent (mg/L)", 723.8),
-    ("Nickel Influent (mg/L)", 779.8), ("Nickel Effluent (mg/L)", 835.7),
-    ("Zinc Influent (mg/L)", 891.7), ("Zinc Effluent (mg/L)", 947.7),
-    ("Silver Influent (mg/L)", 1003.6), ("Silver Effluent (mg/L)", 1059.6),
-    ("Lead Influent (mg/L)", 1115.5), ("Lead Effluent (mg/L)", 1171.5),
+    ("Date", 43.8),
+    ("Influent NH3-N PPM", 126.0),
+    ("Grease Inf. PPM", 166.5),
+    ("Grease Eff. PPM", 207.0),
+    ("Secondary System MLSS PPM", 247.5),
+    ("Secondary System Return SS", 288.0),
+    ("Secondary System SVI", 328.6),
+    ("Secondary System 30 Min Set. Sol.", 369.1),
+    ("Digested Sludge % TS", 409.6),
+    ("Digested Sludge % VS", 450.1),
+    ("Wet Sludge To Digester (1000's of Gallons)", 531.2),
+    ("Digester Influent % TS", 612.2),
+    ("Digester Influent % VS", 652.7),
+    ("In Digester % TS", 693.2),
+    ("In Digester % VS", 733.7),
+    ("Digester No. 2 pH", 774.3),
+    ("Digester No. 2 Alkalinity PPM", 814.8),
+    ("Digester No. 2 Vol. Acids PPM", 855.3),
+    ("Digester No. 4 pH", 895.8),
+    ("Digester No. 4 Alkalinity PPM", 936.3),
+    ("Digester No. 4 Vol. Acids PPM", 976.9),
+    ("Digester No. 6 pH", 1017.4),
+    ("Digester No. 6 Alkalinity PPM", 1057.9),
+    ("Digester No. 6 Vol. Acids PPM", 1098.4),
+    ("Anaerobic Digester Detention Time, Days", 1179.4),
+]
+
+KUB_PAGE3_FIELDS = [
+    ("Date", 43.8),
+    ("Cadmium Influent mg/L", 171.6),
+    ("Cadmium Effluent mg/L", 230.4),
+    ("Chromium Influent mg/L", 289.1),
+    ("Chromium Effluent mg/L", 347.9),
+    ("Copper Influent mg/L", 406.6),
+    ("Copper Effluent mg/L", 465.4),
+    ("Nickel Influent mg/L", 524.1),
+    ("Nickel Effluent mg/L", 582.9),
+    ("Zinc Influent mg/L", 641.6),
+    ("Zinc Effluent mg/L", 700.4),
+    ("Silver Influent mg/L", 759.1),
+    ("Silver Effluent mg/L", 817.9),
+    ("Lead Influent mg/L", 876.6),
+    ("Lead Effluent mg/L", 935.4),
+    ("Filter Press % Solids", 994.1),
+    ("Filter Press Lbs of Solids", 1052.9),
+    ("Solids Disposal Farm Loads", 1111.6),
+    ("Solids Disposal Landfill Loads", 1170.4),
 ]
 
 
@@ -155,21 +207,39 @@ def is_kub_fourth_creek(pdf) -> bool:
         return False
     required = [
         "report of operation of wastewater treatment plant",
-        "influent flows", "5-day bod", "set solids", "final effluent parameters",
+        "influent flows",
+        "set solids",
+        "final effluent parameters",
     ]
-    return sum(term in text for term in required) >= 4
+    has_cbod = "5-day cbod" in text or "5-day bod" in text
+    return sum(term in text for term in required) >= 3 and has_cbod
 
 
-def extract_kub_pdf(data: bytes, source_name: str) -> list[DetectedDataset]:
+def extract_kub_pdf(
+    data: bytes,
+    source_name: str,
+    selected_pages=None,
+) -> list[DetectedDataset]:
     out = []
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         if not pdf.pages:
             return out
 
-        p1 = extract_known_page(pdf.pages[0], KUB_PAGE1_FIELDS)
+        selected = set(
+            int(page_number)
+            for page_number in (
+                selected_pages or range(1, len(pdf.pages) + 1)
+            )
+        )
+
+        p1 = (
+            extract_known_page(pdf.pages[0], KUB_PAGE1_FIELDS)
+            if 1 in selected
+            else pd.DataFrame()
+        )
         if not p1.empty:
             out.append(DetectedDataset(
-                name="Daily MOR - Page 1", source_name=source_name, dataframe=p1,
+                name="PDF Page 1", source_name=source_name, dataframe=p1,
                 confidence="High",
                 notes=[
                     "Recognized Fourth Creek/KUB MOR layout.",
@@ -177,15 +247,26 @@ def extract_kub_pdf(data: bytes, source_name: str) -> list[DetectedDataset]:
                 ],
             ))
 
-        if len(pdf.pages) >= 2:
+        if len(pdf.pages) >= 2 and 2 in selected:
             p2 = extract_known_page(pdf.pages[1], KUB_PAGE2_FIELDS)
             if not p2.empty:
                 out.append(DetectedDataset(
-                    name="Secondary System - Page 2", source_name=source_name, dataframe=p2,
+                    name="PDF Page 2", source_name=source_name, dataframe=p2,
                     confidence="High",
                     notes=[
-                        "Recognized Fourth Creek/KUB secondary-system table.",
-                        "This DO is separate from the page-1 DO column.",
+                        "Recognized Fourth Creek/KUB MOR page 2 layout.",
+                    ],
+                ))
+
+        if len(pdf.pages) >= 3 and 3 in selected:
+            p3 = extract_known_page(pdf.pages[2], KUB_PAGE3_FIELDS)
+            if not p3.empty:
+                out.append(DetectedDataset(
+                    name="PDF Page 3", source_name=source_name, dataframe=p3,
+                    confidence="High",
+                    notes=[
+                        "Recognized Fourth Creek/KUB MOR page 3 layout.",
+                        "Each metal keeps a separate influent and effluent field.",
                     ],
                 ))
     return out
@@ -1584,6 +1665,27 @@ def extract_pdf(data: bytes, source_name: str, selected_pages=None) -> list[Dete
             "Scanned/image-only PDF detected. MORganizer currently supports "
             "text-based PDFs, Excel files, and ZIP files containing those formats. "
             "OCR extraction is disabled for reliability."
+        )
+
+    # This recurring KUB/TDEC MOR uses a fixed three-page form. Its sparse
+    # fields can make value-derived column detection vary from month to month,
+    # which creates parallel headers when several months are combined. Use the
+    # verified physical column map for this known form so every month receives
+    # the same schema, including one influent/effluent pair for each metal.
+    known_kub_layout = False
+    try:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            known_kub_layout = is_kub_fourth_creek(pdf)
+    except Exception:
+        # Unknown or damaged PDFs still get a chance through the generic
+        # position-based parser below.
+        known_kub_layout = False
+
+    if known_kub_layout:
+        return extract_kub_pdf(
+            data,
+            source_name,
+            selected_pages=pages,
         )
 
     datasets = extract_generic_pdf(
