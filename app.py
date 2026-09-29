@@ -176,8 +176,27 @@ def prepare_items(uploads):
 
 
 def filename_month_period(filename):
-    """Return the month declared by a MOR filename, without reading file contents."""
+    """
+    Return the MOR month/year declared by a filename.
+
+    The parser's existing filename reader is tried first. QC then accepts a
+    compact form such as KUW-MOR03-2021.pdf without changing parser behavior.
+    """
     parsed = parse_month_year_from_filename(filename)
+
+    if not parsed:
+        stem = Path(filename).stem
+        compact = re.search(
+            r"(?i)(?:^|[^A-Z0-9])MOR\s*(0?[1-9]|1[0-2])[\s._-]+(\d{2}|\d{4})(?!\d)",
+            stem,
+        )
+        if compact:
+            month = int(compact.group(1))
+            year = int(compact.group(2))
+            if year < 100:
+                year += 2000 if year <= 79 else 1900
+            parsed = (month, year)
+
     if not parsed:
         return None
 
@@ -185,25 +204,13 @@ def filename_month_period(filename):
     return pd.Period(f"{year:04d}-{month:02d}", freq="M")
 
 
-def build_filename_calendar_qc(items):
-    """
-    Build upload-calendar QC from filenames only.
-
-    This deliberately does not alter parsing, extracted columns, or extracted
-    dates. Filenames are the source of truth for which monthly MORs were
-    supplied, while extracted dates are checked separately for mismatches.
-    """
-    document_names = [
-        name
-        for name, _ in items
-        if Path(name).suffix.lower() in {".pdf", ".xls", ".xlsx", ".xlsm"}
-    ]
-
+def _calendar_qc_from_assignments(document_names, assigned_periods, content_resolved=None):
+    """Build month completeness results from one resolved month per document."""
     month_to_files = {}
     unrecognized_files = []
 
     for name in document_names:
-        period = filename_month_period(name)
+        period = assigned_periods.get(name)
         if period is None:
             unrecognized_files.append(name)
             continue
@@ -229,11 +236,68 @@ def build_filename_calendar_qc(items):
         "missing_months": missing_months,
         "duplicate_months": duplicate_months,
         "unrecognized_files": sorted(unrecognized_files),
+        "content_resolved": content_resolved or {},
     }
 
 
+def build_filename_calendar_qc(items):
+    """Build the first-pass upload calendar from filenames only."""
+    document_names = [
+        name
+        for name, _ in items
+        if Path(name).suffix.lower() in {".pdf", ".xls", ".xlsx", ".xlsm"}
+    ]
+    assigned = {name: filename_month_period(name) for name in document_names}
+    return _calendar_qc_from_assignments(document_names, assigned)
+
+
+def build_resolved_calendar_qc(items, datasets):
+    """
+    Resolve the upload calendar using filenames first, then dates inside the MOR.
+
+    Looking inside a file is a QC fallback only. It does not alter parsing,
+    extracted dates, headers, columns, or values.
+    """
+    document_names = [
+        name
+        for name, _ in items
+        if Path(name).suffix.lower() in {".pdf", ".xls", ".xlsx", ".xlsm"}
+    ]
+
+    assigned = {name: filename_month_period(name) for name in document_names}
+    observed_by_source = {}
+
+    for ds in datasets:
+        source_name = ds.source_name
+        if source_name not in assigned or "Date" not in ds.dataframe.columns:
+            continue
+
+        dates = pd.to_datetime(ds.dataframe["Date"], errors="coerce").dropna()
+        if dates.empty:
+            continue
+
+        periods = pd.PeriodIndex(dates, freq="M").unique()
+        observed_by_source.setdefault(source_name, set()).update(periods.tolist())
+
+    content_resolved = {}
+    for name in document_names:
+        if assigned.get(name) is not None:
+            continue
+
+        observed = sorted(observed_by_source.get(name, set()))
+        if len(observed) == 1:
+            assigned[name] = observed[0]
+            content_resolved[name] = observed[0]
+
+    return _calendar_qc_from_assignments(
+        document_names,
+        assigned,
+        content_resolved=content_resolved,
+    )
+
+
 def filename_calendar_flags(qc):
-    """Convert filename-calendar findings into the standard QA/QC flag format."""
+    """Convert upload-calendar findings into the standard QA/QC flag format."""
     flags = []
 
     missing = qc.get("missing_months", [])
@@ -242,7 +306,7 @@ def filename_calendar_flags(qc):
         flags.append({
             "severity": "warning",
             "field": "Uploaded files",
-            "issue": "Missing month(s) based on uploaded filenames: " + ", ".join(labels),
+            "issue": "Missing month(s) in uploaded MOR set: " + ", ".join(labels),
             "count": len(missing),
         })
 
@@ -267,7 +331,8 @@ def filename_calendar_flags(qc):
             "severity": "warning",
             "field": "Uploaded files",
             "issue": (
-                f"{len(unrecognized)} filename(s) could not be matched to a MOR month/year: "
+                f"{len(unrecognized)} file(s) could not be matched to a MOR month/year "
+                "from either the filename or extracted dates: "
                 + shown
                 + ("…" if len(unrecognized) > 8 else "")
             ),
@@ -425,6 +490,8 @@ if stored:
                 "errors",
                 "prepared_items",
                 "prep_errors",
+                "calendar_qc_resolved",
+                "calendar_crosscheck_flags",
             ]:
                 st.session_state.pop(key, None)
 
@@ -452,6 +519,8 @@ if uploads:
         st.session_state.pop("datasets", None)
         st.session_state.pop("errors", None)
         st.session_state.pop("prepared_items", None)
+        st.session_state.pop("calendar_qc_resolved", None)
+        st.session_state.pop("calendar_crosscheck_flags", None)
 
         for key in list(st.session_state.keys()):
             if (
@@ -471,25 +540,46 @@ if uploads:
     prep_errors = st.session_state.get("prep_errors", [])
 
     # ---------------------------------------------------------------
-    # Upload calendar QC — filenames only; does not touch parsing
+    # Upload calendar QC — filename first, extracted-date fallback after detection
     # ---------------------------------------------------------------
     filename_calendar_qc = build_filename_calendar_qc(items)
+    calendar_qc = st.session_state.get("calendar_qc_resolved", filename_calendar_qc)
 
-    recognized = filename_calendar_qc["recognized_count"]
-    document_count = filename_calendar_qc["document_count"]
-    present_months = filename_calendar_qc["present_months"]
+    recognized = calendar_qc["recognized_count"]
+    document_count = calendar_qc["document_count"]
+    present_months = calendar_qc["present_months"]
 
     if document_count:
         if present_months:
             first_month = present_months[0].strftime("%B %Y")
             last_month = present_months[-1].strftime("%B %Y")
             st.caption(
-                f"Filename calendar: {recognized}/{document_count} file(s) matched to "
+                f"Upload calendar: {recognized}/{document_count} file(s) matched to "
                 f"{len(present_months)} unique month(s), {first_month} through {last_month}."
             )
 
-        for flag in filename_calendar_flags(filename_calendar_qc):
-            st.warning(flag["issue"])
+        content_resolved = calendar_qc.get("content_resolved", {})
+        if content_resolved:
+            resolved_text = "; ".join(
+                f"{Path(name).name} → {period.strftime('%B %Y')}"
+                for name, period in sorted(content_resolved.items())
+            )
+            st.info("Month/year confirmed from dates inside MOR: " + resolved_text)
+
+        # If a filename is still unresolved before detection, do not present
+        # potentially false missing-month conclusions as final.
+        if "datasets" in st.session_state or not calendar_qc.get("unrecognized_files"):
+            for flag in filename_calendar_flags(calendar_qc):
+                st.warning(flag["issue"])
+        elif calendar_qc.get("unrecognized_files"):
+            shown = ", ".join(
+                Path(name).name for name in calendar_qc["unrecognized_files"][:8]
+            )
+            st.info(
+                "Some filename month/year values need a content check after field detection: "
+                + shown
+                + ("…" if len(calendar_qc["unrecognized_files"]) > 8 else "")
+            )
 
     # ---------------------------------------------------------------
     # Worksheet selection
@@ -773,6 +863,10 @@ if uploads:
         st.session_state["calendar_crosscheck_flags"] = (
             crosscheck_filename_months_against_detected_dates(datasets)
         )
+        st.session_state["calendar_qc_resolved"] = build_resolved_calendar_qc(
+            items,
+            datasets,
+        )
         st.session_state["datasets"] = combine_same_named_datasets(datasets)
         st.session_state["errors"] = errors
 
@@ -982,10 +1076,10 @@ if "datasets" in st.session_state:
 
     # Month inventory comes from filenames so parser output cannot invent a
     # month that was never uploaded.
-    if filename_calendar_qc["present_months"]:
+    if calendar_qc["present_months"]:
         filename_month_labels = [
             period.strftime("%B %Y")
-            for period in filename_calendar_qc["present_months"]
+            for period in calendar_qc["present_months"]
         ]
         st.caption(
             f"Months identified from uploaded filenames ({len(filename_month_labels)}): "
@@ -1238,7 +1332,7 @@ if "datasets" in st.session_state:
     )
 
     flags = []
-    flags.extend(filename_calendar_flags(filename_calendar_qc))
+    flags.extend(filename_calendar_flags(calendar_qc))
     flags.extend(st.session_state.get("calendar_crosscheck_flags", []))
     flags.extend(qa_flags(preview, original_names_by_output=renamed_from))
 
